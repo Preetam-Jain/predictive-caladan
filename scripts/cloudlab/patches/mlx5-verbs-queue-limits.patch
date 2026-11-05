@@ -1,0 +1,198 @@
+diff --git a/drivers/common/mlx5/mlx5_prm.h b/drivers/common/mlx5/mlx5_prm.h
+index 742c274..7accdea 100644
+--- a/drivers/common/mlx5/mlx5_prm.h
++++ b/drivers/common/mlx5/mlx5_prm.h
+@@ -41,6 +41,7 @@
+ /* Hardware index widths. */
+ #define MLX5_CQ_INDEX_WIDTH 24
+ #define MLX5_WQ_INDEX_WIDTH 16
++#define MLX5_WQ_INDEX_MAX (1u << (MLX5_WQ_INDEX_WIDTH - 1))
+ 
+ /* WQE Segment sizes in bytes. */
+ #define MLX5_WSEG_SIZE 16u
+diff --git a/drivers/net/mlx5/mlx5.h b/drivers/net/mlx5/mlx5.h
+index 0194887..ff18299 100644
+--- a/drivers/net/mlx5/mlx5.h
++++ b/drivers/net/mlx5/mlx5.h
+@@ -2303,6 +2303,7 @@ int mlx5_representor_info_get(struct rte_eth_dev *dev,
+ 		(((repr_id) >> 12) & 3)
+ uint16_t mlx5_representor_id_encode(const struct mlx5_switch_info *info,
+ 				    enum rte_eth_representor_type hpf_type);
++uint16_t mlx5_dev_get_max_wq_size(struct mlx5_dev_ctx_shared *sh);
+ int mlx5_dev_infos_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *info);
+ int mlx5_fw_version_get(struct rte_eth_dev *dev, char *fw_ver, size_t fw_size);
+ const uint32_t *mlx5_dev_supported_ptypes_get(struct rte_eth_dev *dev,
+diff --git a/drivers/net/mlx5/mlx5_devx.c b/drivers/net/mlx5/mlx5_devx.c
+index a12891a..a2a0936 100644
+--- a/drivers/net/mlx5/mlx5_devx.c
++++ b/drivers/net/mlx5/mlx5_devx.c
+@@ -1593,7 +1593,9 @@ mlx5_txq_devx_obj_new(struct rte_eth_dev *dev, uint16_t idx)
+ 	wqe_size = RTE_ALIGN(wqe_size, MLX5_WQE_SIZE) / MLX5_WQE_SIZE;
+ 	/* Create Send Queue object with DevX. */
+ 	wqe_n = RTE_MIN((1UL << txq_data->elts_n) * wqe_size,
+-			(uint32_t)priv->sh->dev_cap.max_qp_wr);
++			/* Original DPDK code, retained for comparison. */
++// 			(uint32_t)priv->sh->dev_cap.max_qp_wr);
++			(uint32_t)mlx5_dev_get_max_wq_size(priv->sh));
+ 	log_desc_n = log2above(wqe_n);
+ 	ret = mlx5_txq_create_devx_sq_resources(dev, idx, log_desc_n);
+ 	if (ret) {
+diff --git a/drivers/net/mlx5/mlx5_ethdev.c b/drivers/net/mlx5/mlx5_ethdev.c
+index 7708a0b..8b7a912 100644
+--- a/drivers/net/mlx5/mlx5_ethdev.c
++++ b/drivers/net/mlx5/mlx5_ethdev.c
+@@ -314,6 +314,37 @@ mlx5_set_txlimit_params(struct rte_eth_dev *dev, struct rte_eth_dev_info *info)
+ 	info->tx_desc_lim.nb_mtu_seg_max = nb_max;
+ }
+ 
++/**
++ * Get maximal work queue size in WQEs
++ *
++ * @param sh
++ *   Pointer to the device shared context.
++ * @return
++ *   Maximal number of WQEs in queue
++ */
++uint16_t
++mlx5_dev_get_max_wq_size(struct mlx5_dev_ctx_shared *sh)
++{
++	uint16_t max_wqe = MLX5_WQ_INDEX_MAX;
++
++	if (sh->cdev->config.devx) {
++		/* use HCA properties for DevX config */
++		MLX5_ASSERT(sh->cdev->config.hca_attr.log_max_wq_sz != 0);
++		MLX5_ASSERT(sh->cdev->config.hca_attr.log_max_wq_sz < MLX5_WQ_INDEX_WIDTH);
++		if (sh->cdev->config.hca_attr.log_max_wq_sz != 0 &&
++		    sh->cdev->config.hca_attr.log_max_wq_sz < MLX5_WQ_INDEX_WIDTH)
++			max_wqe = 1u << sh->cdev->config.hca_attr.log_max_wq_sz;
++	} else {
++		/* use IB device capabilities */
++		MLX5_ASSERT(sh->dev_cap.max_qp_wr > 0);
++		MLX5_ASSERT((unsigned int)sh->dev_cap.max_qp_wr <= MLX5_WQ_INDEX_MAX);
++		if (sh->dev_cap.max_qp_wr > 0 &&
++		    (uint32_t)sh->dev_cap.max_qp_wr <= MLX5_WQ_INDEX_MAX)
++			max_wqe = (uint16_t)sh->dev_cap.max_qp_wr;
++	}
++	return max_wqe;
++}
++
+ /**
+  * DPDK callback to get information about the device.
+  *
+@@ -327,6 +358,7 @@ mlx5_dev_infos_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *info)
+ {
+ 	struct mlx5_priv *priv = dev->data->dev_private;
+ 	unsigned int max;
++	uint16_t max_wqe;
+ 
+ 	/* FIXME: we should ask the device for these values. */
+ 	info->min_rx_bufsize = 32;
+@@ -359,10 +391,14 @@ mlx5_dev_infos_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *info)
+ 	info->flow_type_rss_offloads = ~MLX5_RSS_HF_MASK;
+ 	mlx5_set_default_params(dev, info);
+ 	mlx5_set_txlimit_params(dev, info);
+-	info->rx_desc_lim.nb_max =
+-		1 << priv->sh->cdev->config.hca_attr.log_max_wq_sz;
+-	info->tx_desc_lim.nb_max =
+-		1 << priv->sh->cdev->config.hca_attr.log_max_wq_sz;
++	/* Original DPDK code, retained for comparison. */
++// 	info->rx_desc_lim.nb_max =
++// 		1 << priv->sh->cdev->config.hca_attr.log_max_wq_sz;
++// 	info->tx_desc_lim.nb_max =
++// 		1 << priv->sh->cdev->config.hca_attr.log_max_wq_sz;
++	max_wqe = mlx5_dev_get_max_wq_size(priv->sh);
++	info->rx_desc_lim.nb_max = max_wqe;
++	info->tx_desc_lim.nb_max = max_wqe;
+ 	if (priv->sh->cdev->config.hca_attr.mem_rq_rmp &&
+ 	    priv->obj_ops.rxq_obj_new == devx_obj_ops.rxq_obj_new)
+ 		info->dev_capa |= RTE_ETH_DEV_CAPA_RXQ_SHARE;
+diff --git a/drivers/net/mlx5/mlx5_rxq.c b/drivers/net/mlx5/mlx5_rxq.c
+index 5cf7d49..49b7990 100644
+--- a/drivers/net/mlx5/mlx5_rxq.c
++++ b/drivers/net/mlx5/mlx5_rxq.c
+@@ -655,7 +655,9 @@ mlx5_rx_queue_pre_setup(struct rte_eth_dev *dev, uint16_t idx, uint16_t *desc,
+ 	struct mlx5_rxq_priv *rxq;
+ 	bool empty;
+ 
+-	if (*desc > 1 << priv->sh->cdev->config.hca_attr.log_max_wq_sz) {
++	/* Original DPDK code, retained for comparison. */
++// 	if (*desc > 1 << priv->sh->cdev->config.hca_attr.log_max_wq_sz) {
++	if (*desc > mlx5_dev_get_max_wq_size(priv->sh)) {
+ 		DRV_LOG(ERR,
+ 			"port %u number of descriptors requested for Rx queue"
+ 			" %u is more than supported",
+diff --git a/drivers/net/mlx5/mlx5_trigger.c b/drivers/net/mlx5/mlx5_trigger.c
+index 4ee44e9..7d4069a 100644
+--- a/drivers/net/mlx5/mlx5_trigger.c
++++ b/drivers/net/mlx5/mlx5_trigger.c
+@@ -217,8 +217,11 @@ mlx5_rxq_start(struct rte_eth_dev *dev)
+ 		/* Should not release Rx queues but return immediately. */
+ 		return -rte_errno;
+ 	}
+-	DRV_LOG(DEBUG, "Port %u dev_cap.max_qp_wr is %d.",
+-		dev->data->port_id, priv->sh->dev_cap.max_qp_wr);
++	/* Original DPDK code, retained for comparison. */
++// 	DRV_LOG(DEBUG, "Port %u dev_cap.max_qp_wr is %d.",
++// 		dev->data->port_id, priv->sh->dev_cap.max_qp_wr);
++	DRV_LOG(DEBUG, "Port %u max work queue size is %d.",
++		dev->data->port_id, mlx5_dev_get_max_wq_size(priv->sh));
+ 	DRV_LOG(DEBUG, "Port %u dev_cap.max_sge is %d.",
+ 		dev->data->port_id, priv->sh->dev_cap.max_sge);
+ 	for (i = 0; i != priv->rxqs_n; ++i) {
+diff --git a/drivers/net/mlx5/mlx5_txq.c b/drivers/net/mlx5/mlx5_txq.c
+index 3e93517..81c3532 100644
+--- a/drivers/net/mlx5/mlx5_txq.c
++++ b/drivers/net/mlx5/mlx5_txq.c
+@@ -333,7 +333,9 @@ mlx5_tx_queue_pre_setup(struct rte_eth_dev *dev, uint16_t idx, uint16_t *desc)
+ {
+ 	struct mlx5_priv *priv = dev->data->dev_private;
+ 
+-	if (*desc > 1 << priv->sh->cdev->config.hca_attr.log_max_wq_sz) {
++	/* Original DPDK code, retained for comparison. */
++// 	if (*desc > 1 << priv->sh->cdev->config.hca_attr.log_max_wq_sz) {
++	if (*desc > mlx5_dev_get_max_wq_size(priv->sh)) {
+ 		DRV_LOG(ERR,
+ 			"port %u number of descriptors requested for Tx queue"
+ 			" %u is more than supported",
+@@ -727,7 +729,9 @@ txq_calc_inline_max(struct mlx5_txq_ctrl *txq_ctrl)
+ 	struct mlx5_priv *priv = txq_ctrl->priv;
+ 	unsigned int wqe_size;
+ 
+-	wqe_size = priv->sh->dev_cap.max_qp_wr / desc;
++	/* Original DPDK code, retained for comparison. */
++// 	wqe_size = priv->sh->dev_cap.max_qp_wr / desc;
++	wqe_size = mlx5_dev_get_max_wq_size(priv->sh) / desc;
+ 	if (!wqe_size)
+ 		return 0;
+ 	/*
+@@ -1082,6 +1086,7 @@ mlx5_txq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
+ {
+ 	struct mlx5_priv *priv = dev->data->dev_private;
+ 	struct mlx5_txq_ctrl *tmpl;
++	uint16_t max_wqe;
+ 
+ 	tmpl = mlx5_malloc(MLX5_MEM_RTE | MLX5_MEM_ZERO, sizeof(*tmpl) +
+ 			   desc * sizeof(struct rte_mbuf *), 0, socket);
+@@ -1107,13 +1112,18 @@ mlx5_txq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
+ 	txq_set_params(tmpl);
+ 	if (txq_adjust_params(tmpl))
+ 		goto error;
+-	if (txq_calc_wqebb_cnt(tmpl) >
+-	    priv->sh->dev_cap.max_qp_wr) {
++	/* Original DPDK code, retained for comparison. */
++// 	if (txq_calc_wqebb_cnt(tmpl) >
++// 	    priv->sh->dev_cap.max_qp_wr) {
++	max_wqe = mlx5_dev_get_max_wq_size(priv->sh);
++	if (txq_calc_wqebb_cnt(tmpl) > max_wqe) {
+ 		DRV_LOG(ERR,
+ 			"port %u Tx WQEBB count (%d) exceeds the limit (%d),"
+ 			" try smaller queue size",
+-			dev->data->port_id, txq_calc_wqebb_cnt(tmpl),
+-			priv->sh->dev_cap.max_qp_wr);
++			/* Original DPDK code, retained for comparison. */
++// 			dev->data->port_id, txq_calc_wqebb_cnt(tmpl),
++// 			priv->sh->dev_cap.max_qp_wr);
++			dev->data->port_id, txq_calc_wqebb_cnt(tmpl), max_wqe);
+ 		rte_errno = ENOMEM;
+ 		goto error;
+ 	}

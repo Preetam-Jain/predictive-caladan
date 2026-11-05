@@ -9,3 +9,4 @@ iokerneld
 ._*
 .cargo-local
 .rustup-local
+scripts/__pycache__/

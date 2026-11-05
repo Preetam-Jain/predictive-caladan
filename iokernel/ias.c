@@ -13,6 +13,7 @@
 #include "sched.h"
 #include "ksched.h"
 #include "ias.h"
+#include "telemetry.h"
 
 /* a list of all processes */
 LIST_HEAD(all_procs);
@@ -185,6 +186,36 @@ static void ias_detach(struct proc *p)
 	free(sd);
 }
 
+/* Original upstream Caladan implementation, retained for comparison. */
+// static int ias_run_kthread_on_core(struct ias_data *sd, unsigned int core)
+// {
+// 	int ret;
+//
+// 	/*
+// 	 * WARNING: A kthread could be stuck waiting to detach and thus
+// 	 * temporarily unavailable even if it is no longer assigned to a core.
+// 	 * We check with the scheduler layer here to catch such a race
+// 	 * condition.  In this sense, applications can get new cores more
+// 	 * quickly if they yield promptly when requested.
+// 	 */
+// 	if (sched_threads_avail(sd->p) == 0)
+// 		return -EBUSY;
+//
+// 	ret = sched_run_on_core(sd->p, core);
+// 	if (ret)
+// 		return ret;
+//
+// 	ias_cleanup_core(core);
+// 	cores[core] = sd;
+// 	ias_gen[core]++;
+// 	bitmap_clear(ias_idle_cores, core);
+// 	sd->threads_active++;
+// 	sd->waking = true;
+// 	ias_update_congestion(sd);
+// 	return 0;
+// }
+
+/* Implementation with scheduler-event telemetry. */
 static int ias_run_kthread_on_core(struct ias_data *sd, unsigned int core)
 {
 	int ret;
@@ -206,6 +237,7 @@ static int ias_run_kthread_on_core(struct ias_data *sd, unsigned int core)
 	ias_cleanup_core(core);
 	cores[core] = sd;
 	ias_gen[core]++;
+	telemetry_sched_event(core, sd->p->pid, ias_gen[core], SCHED_WORKER_SCHEDULED);
 	bitmap_clear(ias_idle_cores, core);
 	sd->threads_active++;
 	sd->waking = true;
@@ -220,6 +252,27 @@ static int ias_run_kthread_on_core(struct ias_data *sd, unsigned int core)
  *
  * Returns 0 if successful.
  */
+/* Original upstream Caladan implementation, retained for comparison. */
+// int ias_idle_placeholder_on_core(struct ias_data *sd, unsigned int core)
+// {
+// 	int ret;
+//
+// 	if (!bitmap_test(ias_idle_cores, core)) {
+// 		ret = sched_idle_on_core(0, core);
+// 		if (ret)
+// 			return -EBUSY;
+// 	}
+//
+// 	ias_cleanup_core(core);
+// 	cores[core] = sd;
+// 	ias_gen[core]++;
+// 	bitmap_set(ias_idle_cores, core);
+// 	sd->threads_active++;
+// 	ias_update_congestion(sd);
+// 	return 0;
+// }
+
+/* Implementation with scheduler-event telemetry. */
 int ias_idle_placeholder_on_core(struct ias_data *sd, unsigned int core)
 {
 	int ret;
@@ -233,6 +286,7 @@ int ias_idle_placeholder_on_core(struct ias_data *sd, unsigned int core)
 	ias_cleanup_core(core);
 	cores[core] = sd;
 	ias_gen[core]++;
+	telemetry_sched_event(core, sd->p->pid, ias_gen[core], SCHED_IDLE_PLACEHOLDER);
 	bitmap_set(ias_idle_cores, core);
 	sd->threads_active++;
 	ias_update_congestion(sd);
@@ -245,9 +299,29 @@ int ias_idle_placeholder_on_core(struct ias_data *sd, unsigned int core)
  *
  * Returns 0 if successful.
  */
+/* Original upstream Caladan implementation, retained for comparison. */
+// int ias_idle_on_core(unsigned int core)
+// {
+// 	int ret;
+//
+// 	if (!bitmap_test(ias_idle_cores, core)) {
+// 		ret = sched_idle_on_core(0, core);
+// 		if (ret)
+// 			return -EBUSY;
+// 	}
+//
+// 	ias_cleanup_core(core);
+// 	cores[core] = NULL;
+// 	ias_gen[core]++;
+// 	bitmap_set(ias_idle_cores, core);
+// 	return 0;
+// }
+
+/* Implementation with scheduler-event telemetry. */
 int ias_idle_on_core(unsigned int core)
 {
 	int ret;
+	uint32_t previous_pid = cores[core] ? cores[core]->p->pid : SCHED_PID_NONE;
 
 	if (!bitmap_test(ias_idle_cores, core)) {
 		ret = sched_idle_on_core(0, core);
@@ -258,6 +332,7 @@ int ias_idle_on_core(unsigned int core)
 	ias_cleanup_core(core);
 	cores[core] = NULL;
 	ias_gen[core]++;
+	telemetry_sched_event(core, previous_pid, ias_gen[core], SCHED_CORE_IDLED);
 	bitmap_set(ias_idle_cores, core);
 	return 0;
 }

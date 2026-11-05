@@ -681,6 +681,7 @@ fn process_result_final(
         println!("");
     }
 
+    // Telemetry: trace output provides completed-request timings and server timestamps.
     if let OutputMode::Trace = sched.output {
         print!("Trace: ");
         for p in results.into_iter().filter_map(|p| p.trace).kmerge() {
@@ -746,6 +747,7 @@ fn process_result(sched: &RequestSchedule, packets: &mut [Packet]) -> Option<Sch
     let mut full_stream = 0;
     let mut dropped = 0;
     let mut latencies = BTreeMap::new();
+    // Telemetry: capture per-request outcomes here before they are summarized.
     for p in packets.iter() {
         match (p.actual_start, p.completion_time) {
             (None, _) => sched_miss += 1,

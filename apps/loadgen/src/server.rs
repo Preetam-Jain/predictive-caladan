@@ -28,6 +28,7 @@ pub fn run_linux_udp_server(config: AppConfig) {
                 loop {
                     let (len, remote_addr) = socket.recv_from(&mut buf[..]).unwrap();
                     let payload = Payload::deserialize(&mut &buf[..len]).unwrap();
+                    // Telemetry: timestamp both sides of the synthetic request work.
                     worker.work(payload.work_iterations, payload.randomness);
                     socket.send_to(&buf[..len], remote_addr).unwrap();
                 }
@@ -46,6 +47,7 @@ fn socket_worker(socket: &mut Connection, worker: Arc<FakeWorker>) {
         socket.read_exact(&mut v[..PAYLOAD_SIZE])?;
         let mut payload = Payload::deserialize(&mut &v[..PAYLOAD_SIZE])?;
         v.clear();
+        // Telemetry: timestamp both sides of the synthetic request work.
         worker.work(payload.work_iterations, payload.randomness);
         payload.randomness = shenango::rdtsc();
         payload.serialize_into(&mut v)?;
@@ -95,6 +97,7 @@ pub fn run_spawner_server(addr: SocketAddrV4, workerspec: &str) {
             let mut payload = Payload::deserialize(&mut &buf[..]).unwrap();
             #[allow(static_mut_refs)]
             let worker = SPAWNER_WORKER.as_ref().unwrap();
+            // Telemetry: timestamp both sides of the synthetic request work.
             worker.work(payload.work_iterations, payload.randomness);
             payload.randomness = shenango::rdtsc();
             let mut array = ArrayVec::<_, PAYLOAD_SIZE>::new();
