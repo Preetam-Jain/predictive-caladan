@@ -22,7 +22,7 @@ static void emit_sample(struct stream *stream, uint64_t index)
         telemetry_bandwidth(index + 1, index);
         break;
     case STREAM_LLC:
-        telemetry_llc(7, 42, 9, index + 1, index);
+        telemetry_llc(7, 42, 9, index + 1, index, 123, 8, 8, 10);
         break;
     case STREAM_PMC_FAILURE:
         telemetry_pmc_failure(7, index, index + 1);
@@ -66,8 +66,12 @@ static void verify_file(struct stream *stream)
         } else if (stream->type == STREAM_LLC) {
             struct llc_record sample;
             memcpy(&sample, record, sizeof(sample));
-            assert(sample.misses == index && sample.gen == 9);
-            assert(sample.pid == 42 && sample.core == 7);
+            assert(sample.misses == index && sample.sched_gen_at_request == 9);
+            assert(sample.sched_gen_at_collection == 10);
+            assert(sample.pid_at_request == 42 && sample.core == 7);
+            assert(sample.app_id_at_request == 123);
+            assert(sample.app_owner_gen_at_request == 8);
+            assert(sample.app_owner_gen_at_collection == 8);
         } else if (stream->type == STREAM_PMC_FAILURE) {
             struct pmc_failure_record sample;
             memcpy(&sample, record, sizeof(sample));

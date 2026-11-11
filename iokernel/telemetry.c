@@ -25,10 +25,14 @@ struct bandwidth_record {
 
 struct llc_record {
     uint64_t tsc;
-    uint64_t gen;
+    uint64_t sched_gen_at_request;
     uint64_t misses;
+    uint64_t app_id_at_request;
+    uint64_t app_owner_gen_at_request;
+    uint64_t app_owner_gen_at_collection;
+    uint64_t sched_gen_at_collection;
     uint32_t core;
-    uint32_t pid;
+    uint32_t pid_at_request;
 };
 
 /* A failed gather has no counter value or reliable process attribution. */
@@ -53,6 +57,9 @@ enum stream_type {
     STREAM_LLC = 2,
     STREAM_PMC_FAILURE = 3,
     STREAM_SCHED = 4,
+    STREAM_QUEUE = 5,
+    STREAM_TASK = 6,
+    STREAM_DELAY = 7,
 };
 
 enum failure_reason {
@@ -82,14 +89,17 @@ struct file_header {
     uint32_t cores[];
 };
 
-_Static_assert(sizeof(struct bandwidth_record) == 16, "bandwidth disk layout");
-_Static_assert(sizeof(struct llc_record) == 32, "LLC disk layout");
-_Static_assert(sizeof(struct pmc_failure_record) == 24, "failure disk layout");
-_Static_assert(sizeof(struct sched_event_record) == 24, "scheduler event disk layout");
-_Static_assert(NCPU <= (uint32_t)UINT16_MAX + 1, "scheduler event CPU ID width");
-_Static_assert(sizeof(struct file_header) == 96, "header disk layout");
+_Static_assert(sizeof(struct bandwidth_record) == 16, "bandwidth record size assert failed");
+_Static_assert(sizeof(struct llc_record) == 64, "llc record size assert failed");
+_Static_assert(sizeof(struct pmc_failure_record) == 24, "pmc failure record size assert failed");
+_Static_assert(sizeof(struct sched_event_record) == 24, "scheduler event record size assert failed");
+_Static_assert(sizeof(struct telemetry_queue_record) == 72, "queue record size assert failed");
+_Static_assert(sizeof(struct telemetry_task_record) == 40, "task record size assert failed");
+_Static_assert(sizeof(struct telemetry_delay_record) == 56, "delay record size assert failed");
+_Static_assert(NCPU <= (uint32_t)UINT16_MAX + 1, "scheduler event CPU ID width assert failed");
+_Static_assert(sizeof(struct file_header) == 96, "file header size assert failed");
 _Static_assert(offsetof(struct file_header, cores) == sizeof(struct file_header),
-               "CPU list follows the fixed header");
+               "file header CPU list offset assert failed");
 
 #define BATCH_BYTES (256U * 1024) // 256 KiB
 #define BANDWIDTH_CAPACITY (1U << 16) // 65,536
@@ -97,8 +107,8 @@ _Static_assert(offsetof(struct file_header, cores) == sizeof(struct file_header)
 #define SCHED_EVENT_CAPACITY (1U << 18) // 262,144
 #define FAILURE_CAPACITY (1U << 12) // 4,096
 
-/* Version 5 adds a scheduler-event stream; existing layouts are unchanged. */
-#define FILE_FORMAT_VERSION 5U
+/* Version 8 adds queue, task elapsed-time, and process delay streams. */
+#define FILE_FORMAT_VERSION 8U
 #define MICROSECONDS_PER_SECOND 1000000ULL
 /* Bandwidth comes from the memory controller, not a selected core PMC event. */
 #define PMC_SELECTOR_NOT_APPLICABLE 0ULL
@@ -147,11 +157,35 @@ static struct stream sched_stream = {
     .capacity = SCHED_EVENT_CAPACITY,
     .fd = -1,
 };
+static struct stream queue_stream = {
+    .suffix = ".queue.bin",
+    .type = STREAM_QUEUE,
+    .record_bytes = sizeof(struct telemetry_queue_record),
+    .capacity = SCHED_EVENT_CAPACITY,
+    .fd = -1,
+};
+static struct stream task_stream = {
+    .suffix = ".task.bin",
+    .type = STREAM_TASK,
+    .record_bytes = sizeof(struct telemetry_task_record),
+    .capacity = SCHED_EVENT_CAPACITY,
+    .fd = -1,
+};
+static struct stream delay_stream = {
+    .suffix = ".delay.bin",
+    .type = STREAM_DELAY,
+    .record_bytes = sizeof(struct telemetry_delay_record),
+    .capacity = SCHED_EVENT_CAPACITY,
+    .fd = -1,
+};
 static struct stream *const streams[] = {
     &bandwidth_stream,
     &llc_stream,
     &failure_stream,
     &sched_stream,
+    &queue_stream,
+    &task_stream,
+    &delay_stream,
 };
 
 int telemetry_core = -1;
@@ -467,15 +501,21 @@ void telemetry_bandwidth(uint64_t tsc, uint32_t cas)
     submit(&bandwidth_stream, &record);
 }
 
-void telemetry_llc(uint32_t core, uint32_t pid, uint64_t gen,
-                   uint64_t tsc, uint64_t misses)
+void telemetry_llc(uint32_t core, uint32_t pid_at_request, uint64_t sched_gen_at_request,
+                   uint64_t tsc, uint64_t misses, uint64_t app_id_at_request,
+                   uint64_t app_owner_gen_at_request, uint64_t app_owner_gen_at_collection,
+                   uint64_t sched_gen_at_collection)
 {
     struct llc_record record = {
         .tsc = tsc,
-        .gen = gen,
+        .sched_gen_at_request = sched_gen_at_request,
         .misses = misses,
+        .app_id_at_request = app_id_at_request,
+        .app_owner_gen_at_request = app_owner_gen_at_request,
+        .app_owner_gen_at_collection = app_owner_gen_at_collection,
+        .sched_gen_at_collection = sched_gen_at_collection,
         .core = core,
-        .pid = pid,
+        .pid_at_request = pid_at_request,
     };
     submit(&llc_stream, &record);
 }
@@ -504,4 +544,19 @@ void telemetry_sched_event(uint32_t core, uint32_t pid, uint64_t gen,
         .reason = reason,
     };
     submit(&sched_stream, &record);
+}
+
+void telemetry_queue(const struct telemetry_queue_record *record)
+{
+    submit(&queue_stream, record);
+}
+
+void telemetry_task(const struct telemetry_task_record *record)
+{
+    submit(&task_stream, record);
+}
+
+void telemetry_delay(const struct telemetry_delay_record *record)
+{
+    submit(&delay_stream, record);
 }

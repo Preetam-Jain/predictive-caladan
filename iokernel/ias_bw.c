@@ -24,10 +24,21 @@ float	 ias_bw_estimate_multiplier;
 /* bandwidth threshold in cache lines per cycle for a single channel */
 static float ias_bw_thresh;
 
+/* Original upstream sample layout, retained for comparison. */
+// struct pmc_sample {
+// 	uint64_t gen;
+// 	uint64_t val;
+// 	uint64_t tsc;
+// };
+
 struct pmc_sample {
-	uint64_t gen;
+	uint64_t gen; /* Existing IAS scheduling generation at request time. */
 	uint64_t val;
 	uint64_t tsc;
+	uint64_t app_id_at_request;
+	uint64_t app_owner_gen_at_request;
+	uint32_t pid_at_request;
+	bool request_pending;
 };
 
 static void ias_bw_throttle_core(int core)
@@ -64,13 +75,18 @@ static void ias_bw_request_pmc(uint64_t sel, struct pmc_sample *samples)
 	int core, tmp;
 
 	sched_for_each_allowed_core(core, tmp) {
-		/* Sample both LC and BE applications on eligible assigned cores. */
-		if (!cores[core] || bitmap_test(ias_ht_punished_cores, core)) {
-			samples[core].gen = ias_gen[core] - 1;
+		struct pmc_sample *sample = &samples[core];
+		/* Never overwrite a request still being handled by the target CPU. */
+		if (sample->request_pending || !cores[core] ||
+		    bitmap_test(ias_ht_punished_cores, core))
 			continue;
-		}
 
-		samples[core].gen = ias_gen[core];
+		/* Preserve normal eligibility; ownership can span intervening idle time. */
+		sample->gen = ias_gen[core];
+		sample->app_id_at_request = last_app_id[core];
+		sample->app_owner_gen_at_request = app_owner_gen[core];
+		sample->pid_at_request = last_app_pid[core];
+		sample->request_pending = true;
 		ksched_enqueue_pmc(core, sel);
 	}
 }
@@ -97,20 +113,22 @@ static void ias_bw_request_pmc(uint64_t sel, struct pmc_sample *samples)
 static void ias_bw_gather_pmc(struct pmc_sample *samples)
 {
 	int core, tmp;
-	struct pmc_sample *s;
 
 	sched_for_each_allowed_core(core, tmp) {
-		s = &samples[core];
-		if (s->gen != ias_gen[core])
+		struct pmc_sample *sample = &samples[core];
+		if (!sample->request_pending)
 			continue;
-		if (!ksched_poll_pmc(core, &s->val, &s->tsc)) {
-			s->gen = ias_gen[core] - 1;
+		if (!ksched_poll_pmc(core, &sample->val, &sample->tsc)) {
 			ias_bw_sample_failures++;
-            telemetry_pmc_failure(core, ias_gen[core], rdtsc());
+			telemetry_pmc_failure(core, sample->gen, rdtsc());
 			continue;
 		}
-        if (cores[core])
-            telemetry_llc(core, cores[core]->p->pid, s->gen, s->tsc, s->val);
+		sample->request_pending = false;
+		/* Preserve the physical-core reading even when ownership changed. */
+		telemetry_llc(core, sample->pid_at_request, sample->gen,
+			     sample->tsc, sample->val, sample->app_id_at_request,
+			     sample->app_owner_gen_at_request, app_owner_gen[core],
+			     ias_gen[core]);
 	}
 }
 
@@ -264,7 +282,9 @@ static float ias_measure_bw(void)
 // 	IAS_BW_STATE_PUNISH,
 // };
 
-static struct pmc_sample arr_1[NCPU], arr_2[NCPU];
+/* Original upstream paired buffers, retained for comparison. */
+// static struct pmc_sample arr_1[NCPU], arr_2[NCPU];
+static struct pmc_sample pending_samples[NCPU];
 
 /**
  * ias_bw_poll - runs the bandwidth controller
@@ -371,30 +391,11 @@ static struct pmc_sample arr_1[NCPU], arr_2[NCPU];
 /* Measurement-only implementation with buffered disk telemetry. */
 void ias_bw_poll(void)
 {
-	static struct pmc_sample *start = arr_1, *end = arr_2;
-	static bool sampling_started, first_start_collected;
-
 	assert(!cfg.nobw);
 	ias_measure_bw();
-
-	/* Establish the first interval's start before requesting its end. */
-	if (!sampling_started) {
-		ias_bw_request_pmc(PMC_LLC_MISSES, start);
-		sampling_started = true;
-		return;
-	}
-
-	if (!first_start_collected) {
-		ias_bw_gather_pmc(start);
-		first_start_collected = true;
-	} else {
-		ias_bw_gather_pmc(end);
-
-		swapvars(start, end);
-	}
-
-	/* ksched completes these requests after the scheduler sends interrupts. */
-	ias_bw_request_pmc(PMC_LLC_MISSES, end);
+	ias_bw_gather_pmc(pending_samples);
+	/* ksched handles new requests after the scheduler sends interrupts. */
+	ias_bw_request_pmc(PMC_LLC_MISSES, pending_samples);
 }
 
 int ias_bw_init(void)

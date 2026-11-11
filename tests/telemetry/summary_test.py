@@ -18,7 +18,12 @@ class SummaryTest(unittest.TestCase):
             for suffix, (kind, layout) in LAYOUTS.items():
                 if version == 4 and suffix == 'sched':
                     continue
+                if version >= 6 and suffix == 'llc':
+                    layout = '<QQQQQQII'
                 values = records.get(suffix, [])
+                if version >= 7 and suffix == 'llc':
+                    layout = '<QQQQQQQII'
+                    values = [value[:6] + (value[1] + 1,) + value[6:] for value in values]
                 identity = bytes(16) if different_uuid and kind == 2 else IDENTITY
                 header = struct.pack('<8sIIIIdQIIIIdQQ16s', b'CALATLM\0', version,
                                      96, struct.calcsize(layout), kind, 1000.0,
@@ -53,6 +58,22 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for name in ('worker scheduled', 'idle placeholder', 'core explicitly idled'):
             self.assertIn(f'core=7 pid=42 reason={name} count=1', result.stdout)
+
+    def test_ownership_keeps_same_app_across_scheduling_changes(self):
+        result = self.run_summary({'llc': [
+            (1000, 10, 10, 1, 1, 1, 7, 42),
+            (2000, 11, 20, 1, 1, 1, 7, 42),  # Same app woke again: retain interval.
+            (3000, 12, 30, 1, 1, 2, 7, 42),  # Ownership changed while pending.
+            (4000, 13, 40, 2, 2, 2, 7, 43),
+            (5000, 14, 50, 2, 2, 2, 7, 43),
+            (6000, 15, 60, 1, 3, 3, 7, 42),  # A returned after B.
+            (7000, 16, 70, 3, 4, 4, 7, 42),  # Reused PID, distinct application.
+        ]}, version=7)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('7 7 6 60 0.000006 10000000.000', result.stdout)
+        self.assertIn('7 42 1 4 1 10 0.000001 10000000.000', result.stdout)
+        self.assertIn('7 43 2 2 1 10 0.000001 10000000.000', result.stdout)
+        self.assertIn('application ownership changed/uncertain: 4', result.stdout)
 
     def test_empty_capture(self):
         result = self.run_summary({})

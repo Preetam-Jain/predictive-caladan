@@ -1,8 +1,8 @@
 # Telemetry file format versions
 
 The version identifies the on-disk layout, not a Caladan release or experiment.
-The current writer produces **version 5**. The decoder supports **versions 4 and
-5**, so existing captures remain readable. Versions 1–3 document development
+The current writer produces **version 6**. The decoder supports **versions 4, 5,
+and 6**, so existing captures remain readable. Versions 1–3 document development
 formats and are rejected by the current decoder.
 
 All versions use little-endian integers and IEEE-754 64-bit doubles. A field's
@@ -119,7 +119,7 @@ Matching UUIDs associate files even if they are renamed or moved. Different
 captures receive different IDs. Pairing baseline and enabled runs belongs in
 external experiment metadata.
 
-## Version 5 — scheduler generation-change events (current)
+## Version 5 — scheduler generation-change events
 
 Adds a fourth file, `.sched.bin`, identified by stream type 4. The fixed header
 remains 96 bytes plus the variable CPU list. The original three record layouts
@@ -154,6 +154,65 @@ The ring holds 262,144 records (6 MiB). The existing dedicated writer drains it
 with the other streams. No new worker thread or scheduler policy is introduced.
 Version-5 validation requires all four files. Version-4 captures still require
 only their original three files; no events can be reconstructed retroactively.
+
+## Version 6 — application ownership metadata (current)
+
+The file header and four stream IDs remain unchanged. Only the LLC record layout
+changes, from 32 to **56 bytes**, in this order:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| tsc | u64 | Counter-read timestamp from the target CPU. |
+| sched_gen_at_request | u64 | Original IAS scheduling generation when requested. |
+| misses | u64 | Raw cumulative LLC counter reading. |
+| app_id_at_request | u64 | Application lifetime ID at request time. |
+| app_owner_gen_at_request | u64 | Application ownership generation when requested. |
+| app_owner_gen_at_collection | u64 | Ownership generation when collecting the result. |
+| core | u32 | Logical CPU ID. |
+| pid_at_request | u32 | PID captured when requesting, never looked up at collection. |
+
+Application IDs are monotonic and unique within an IOKernel lifetime, including
+reattachment with a reused PID. Combine with experiment UUID across captures.
+The ownership generation increments when a different application is assigned to
+a core or its owner detaches. Parking, explicit idling, and rescheduling the same
+application preserve ownership. The existing IAS scheduling generation is unchanged.
+
+Completed readings are retained across either kind of generation change. An
+interval may be attributed to an application only when its ID is nonzero and
+identical at both endpoints, and all four ownership-generation values match
+(request and collection for each endpoint). A -> B -> A is detected even when
+endpoint application IDs match. This is IAS assignment attribution, including
+intervening idle/kernel activity; it is not a count of user-mode instructions alone.
+
+The collector keeps one outstanding request per core. A pending request is never
+overwritten; a pending failure record counts an observation, not necessarily a
+unique request. Normal core eligibility is retained: new requests require an
+assigned application and an unpunished core. Collection still accepts a completed
+result after the worker parks or its application detaches. Thus a valid interval
+can span parking without additional interrupts solely to sample an idle core.
+
+The LLC ring still holds 1,048,576 records, now using 56 MiB. More readings can be
+retained than before; disk volume and collection overhead need fresh measurements.
+The decoder and summary continue supporting the old layouts in versions 4 and 5.
+
+## Version 7 — scheduling generation at collection
+
+The header and other streams retain their version-6 layouts. LLC records grow
+from 56 to 64 bytes. Fields appear in this order:
+
+```
+u64 tsc, sched_gen_at_request, misses, app_id_at_request;
+u64 app_owner_gen_at_request, app_owner_gen_at_collection, sched_gen_at_collection;
+u32 core, pid_at_request;
+```
+
+`sched_gen_at_collection` is the current IAS scheduling generation when the
+scheduler collects the completed counter request. It is not the generation at
+which the target CPU actually read the counter. Comparing it with the request
+generation reveals scheduling changes during that period. Attribution continues
+to use application ownership generations, so scheduling changes alone do not
+invalidate an application interval. The LLC ring now occupies 64 MiB.
+The decoder supports versions 4, 5, 6, and 7.
 
 ## Future changes
 

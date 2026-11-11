@@ -55,6 +55,7 @@ def summarize(prefix):
     bandwidth_first = bandwidth_last = None
     llc_first = llc_last = None
     core_stats = defaultdict(lambda: dict(records=0, intervals=0, misses=0, ticks=0))
+    raw_core_stats = defaultdict(lambda: dict(records=0, intervals=0, misses=0, ticks=0))
     failure_counts = Counter()
     skipped_llc = Counter()
     scheduler_events = Counter()
@@ -98,28 +99,57 @@ def summarize(prefix):
                             bandwidth_nonpositive += 1
                     previous_bandwidth = record
                 elif suffix == 'llc':
-                    tsc, generation, misses, core, pid = record
+                    if header.version >= 7:
+                        # Collection scheduling generation is diagnostic metadata;
+                        # application attribution still uses ownership generations.
+                        record = record[:6] + record[7:]
+                    if header.version >= 6:
+                        (tsc, sched_gen, misses, app_id, owner_at_request,
+                         owner_at_collection, core, pid) = record
+                    else:
+                        tsc, sched_gen, misses, core, pid = record
+                        app_id = None
+                        owner_at_request = owner_at_collection = sched_gen
                     llc_first = tsc if llc_first is None else min(llc_first, tsc)
                     llc_last = tsc if llc_last is None else max(llc_last, tsc)
-                    stats = core_stats[core, pid]
+                    stats = core_stats[core, pid, app_id]
                     stats['records'] += 1
+                    raw_stats = raw_core_stats[core]
+                    raw_stats['records'] += 1
                     previous = previous_core.get(core)
                     if previous is not None:
-                        previous_tsc, previous_generation, previous_misses, previous_pid = previous
-                        if generation != previous_generation or pid != previous_pid:
-                            skipped_llc['assignment changed'] += 1
-                            if pid == previous_pid:
-                                same_pid_generation_changes[core] += 1
-                        elif tsc <= previous_tsc:
+                        (previous_tsc, previous_sched_gen, previous_misses, previous_pid,
+                         previous_app_id, previous_owner_request, previous_owner_collection) = previous
+                        if sched_gen != previous_sched_gen and pid == previous_pid:
+                            same_pid_generation_changes[core] += 1
+                        if tsc <= previous_tsc:
                             skipped_llc['nonpositive time'] += 1
                         elif misses < previous_misses:
-                            # Hardware width is absent from v4: never invent wrap counts.
+                            # Hardware width is absent: never invent wrap counts.
                             skipped_llc['counter decreased (wrap/reset)'] += 1
                         else:
-                            stats['intervals'] += 1
-                            stats['ticks'] += tsc - previous_tsc
-                            stats['misses'] += misses - previous_misses
-                    previous_core[core] = (tsc, generation, misses, pid)
+                            ticks = tsc - previous_tsc
+                            miss_delta = misses - previous_misses
+                            raw_stats['intervals'] += 1
+                            raw_stats['ticks'] += ticks
+                            raw_stats['misses'] += miss_delta
+                            same_owner = (
+                                app_id != 0 and app_id == previous_app_id
+                                and pid == previous_pid
+                                and owner_at_request == owner_at_collection
+                                and previous_owner_request == previous_owner_collection
+                                and owner_at_request == previous_owner_request
+                            )
+                            if same_owner:
+                                stats['intervals'] += 1
+                                stats['ticks'] += ticks
+                                stats['misses'] += miss_delta
+                            else:
+                                reason = ('application ownership changed/uncertain'
+                                          if header.version >= 6 else 'assignment changed')
+                                skipped_llc[reason] += 1
+                    previous_core[core] = (tsc, sched_gen, misses, pid, app_id,
+                                           owner_at_request, owner_at_collection)
                 elif suffix == 'pmc-failure':
                     _, _, core, reason = record
                     failure_counts[core, reason] += 1
@@ -153,12 +183,24 @@ def summarize(prefix):
         end = (llc_last - bandwidth_first) / frequency / MICROSECONDS_PER_SECOND
         print(f'LLC record window relative to bandwidth start: {start:.6f}–{end:.6f} s')
         print('  This is sampling coverage, not proof of the client workload window.')
-    print('LLC by core/PID (rates use only valid matching-assignment intervals):')
-    print('  core pid records intervals misses covered_s misses/s')
-    for (core, pid), stats in sorted(core_stats.items()):
+    print('Raw LLC by core (includes all application assignments and idle time):')
+    print('  core records intervals misses covered_s misses/s')
+    for core, stats in sorted(raw_core_stats.items()):
         seconds = stats['ticks'] / frequency / MICROSECONDS_PER_SECOND
         rate = stats['misses'] / seconds if seconds else 0
-        print(f"  {core} {pid} {stats['records']} {stats['intervals']} "
+        print(f"  {core} {stats['records']} {stats['intervals']} "
+              f"{stats['misses']} {seconds:.6f} {rate:.3f}")
+    if headers[0][1].version >= 6:
+        print('LLC by application (includes idle time with unchanged application ownership):')
+        print('  core pid app_id records intervals misses covered_s misses/s')
+    else:
+        print('LLC by core/PID (legacy scheduling-generation check):')
+        print('  core pid records intervals misses covered_s misses/s')
+    for (core, pid, app_id), stats in sorted(core_stats.items()):
+        seconds = stats['ticks'] / frequency / MICROSECONDS_PER_SECOND
+        rate = stats['misses'] / seconds if seconds else 0
+        app_column = f'{app_id} ' if app_id is not None else ''
+        print(f"  {core} {pid} {app_column}{stats['records']} {stats['intervals']} "
               f"{stats['misses']} {seconds:.6f} {rate:.3f}")
     for reason, count in sorted(skipped_llc.items()):
         print(f'LLC intervals skipped: {reason}: {count}')

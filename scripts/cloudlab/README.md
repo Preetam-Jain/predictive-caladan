@@ -18,7 +18,7 @@ forwarding; no NETWORK_MODE prefix is needed.
 | smoke.sh iokernel node0\|node1 | Respective node | Run the local IOKernel. |
 | smoke.sh server / client [SECONDS] | node0 / node1 | Run server / load generator (client default: 120 seconds; use 10 for smoke test). |
 | smoke.sh capture [PREFIX [SECONDS]] | node0 | Run the IOKernel with telemetry; default unique prefix and 180 seconds. |
-| smoke.sh check-capture [PREFIX] | node0 | Validate the latest or specified capture (three streams in v4, four in v5) without CSV output. |
+| smoke.sh check-capture [PREFIX] | node0 | Validate the latest or specified capture (three streams in v4, four in v5/v6) without CSV output. |
 | smoke.sh summarize [PREFIX] | node0 | Summarize sample intervals, bandwidth, LLC activity, and failures. |
 | nic-debug.sh [PCI_ADDRESS] | Affected node | Read-only mlx5 startup diagnostics. |
 

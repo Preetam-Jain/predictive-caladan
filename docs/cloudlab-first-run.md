@@ -149,9 +149,10 @@ before terminating the capture IOKernel. Then validate the latest files on node0
 
 It prints decoder metadata/counts without generating large CSVs. To choose a
 prefix/duration explicitly use `smoke.sh capture /path/to/run01 120`; existing
-files are refused. `smoke.sh check-capture /path/to/run01` validates that capture. New version-5 captures include a fourth .sched.bin file
-recording why core assignment generations change; old version-4 files remain
-readable. summarize reports the reason counts.
+files are refused. `smoke.sh check-capture /path/to/run01` validates that capture. New captures include a fourth .sched.bin file
+recording why core assignment generations change; old version-4/5 files remain
+readable. Version 6 retains raw LLC readings across scheduling changes and records
+application ownership at request/collection. summarize reports the reason counts.
 
 ## Troubleshooting and next experiments
 

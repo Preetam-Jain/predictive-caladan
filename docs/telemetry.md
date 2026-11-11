@@ -16,7 +16,7 @@ The path is an output **prefix**. This command creates four new files:
 | File | Record size | Contents | Ring capacity |
 | --- | ---: | --- | ---: |
 | `/data/run01.bw.bin` | 16 bytes | TSC and channel-0 CAS counter | 65,536 records (1 MiB) |
-| `/data/run01.llc.bin` | 32 bytes | TSC, assignment generation, LLC counter, CPU, PID | 1,048,576 records (32 MiB) |
+| `/data/run01.llc.bin` | 64 bytes | Counter/TSC plus request/collection application ownership | 1,048,576 records (64 MiB) |
 | `/data/run01.pmc-failure.bin` | 24 bytes | Observation TSC, assignment generation, CPU, reason | 4,096 records (96 KiB) |
 | `/data/run01.sched.bin` | 24 bytes | Decision TSC, new generation, PID, CPU, reason | 262,144 records (6 MiB) |
 
@@ -82,7 +82,9 @@ This streams binary records without writing CSV or loading the dataset into RAM.
 It reports interval cadence, the five largest gaps with capture-relative times,
 estimated mean bandwidth, per-core/PID LLC deltas and
 rates, skipped invalid intervals, and failure counts. Cross-stream experiment and
-hardware metadata must match. Bandwidth CAS wraps are handled modulo 2^32; LLC
+hardware metadata must match. Version 6 reports application ownership separately
+from scheduling generations, so parking/resuming the same application can retain
+valid intervals. Older captures cannot recover readings discarded before logging. Bandwidth CAS wraps are handled modulo 2^32; LLC
 counter decreases are skipped because the file does not encode counter width.
 Interval percentiles are approximate from a bounded systematic sample.
 
@@ -93,7 +95,7 @@ predictor evaluation or proof of acceptable instrumentation overhead.
 ## Decoding and format
 
 See [format version history](telemetry-format-versions.md) for layouts and changes
-from versions 1 through 5. The current decoder supports versions 4 and 5.
+from versions 1 through 6. The current decoder supports versions 4, 5, and 6.
 
 ```
 python3 scripts/decode_telemetry.py /data/run01.bw.bin > /data/run01.bw.csv
@@ -106,7 +108,7 @@ The decoder streams CSV to stdout and metadata/counts to stderr. It validates
 completion, layout, declared record count, truncation, and trailing data. Align
 streams by TSC, not record position: each can have different rates and drops.
 
-Version 5 is little-endian. Version 4 remains supported; versions 1–3 are rejected. The fixed 96-byte header:
+Version 6 is little-endian. Versions 4 and 5 remain supported; versions 1–3 are rejected. The fixed 96-byte header:
 
 - 8-byte magic `CALATLM\0`.
 - u32 version, total header bytes, record bytes, stream type.
@@ -133,10 +135,14 @@ Record layouts, identified once per file by stream type:
    TSC is read just before CAS. Subtract CAS modulo 2^32, divide by elapsed TSC,
    and multiply by the header bandwidth multiplier for estimated decimal MB/s.
    Assumes fewer than 2^32 CAS events between selected endpoints.
-2. LLC: u64 TSC, u64 assignment generation, u64 misses, u32 CPU, u32 PID.
-   TSC is read immediately after the hardware counter on the target CPU. Compute
-   intervals only between matching CPU and generation; account for hardware
-   counter width on wrap. Versions 4/5 do not encode hardware counter width.
+2. LLC (v7): u64 TSC, u64 sched_gen_at_request, u64 misses, u64 app_id_at_request,
+   u64 app_owner_gen_at_request, u64 app_owner_gen_at_collection, u64 sched_gen_at_collection, u32 CPU,
+   u32 pid_at_request. Completed raw readings survive scheduling/ownership changes.
+   Core-level differences do not require matching ownership. Application-level
+   differences require the same nonzero application ID at both endpoints and all
+   four request/collection ownership generations to match. Counter decreases are
+   skipped because counter width is not encoded. Versions 4/5 retain their old
+   32-byte layout and strict scheduling-generation checks in the summary.
 3. PMC failure: u64 observation TSC, u64 assignment generation, u32 CPU,
    u32 reason (1 = request still pending at gather). This is not a counter reading.
 
@@ -147,8 +153,31 @@ Record layouts, identified once per file by stream type:
    and generations allow matching these events to LLC records. The summary counts
    each reason by core/PID. Old version-4 captures have no scheduler events.
 
-Generation mismatches are skipped. Inspect timestamp gaps, failures, and per-stream
-drops before analysis. Drop counts are aggregate per stream, not per CPU.
+Uncertain application attribution does not discard physical-core readings in v6 and later.
+The summary reports raw core counts separately from application-associated counts.
+Ownership survives parking and resets when another application takes the core or
+the previous application detaches. New requests still use normal eligibility;
+idle cores are not woken just to sample. Inspect timestamp gaps, failures, and
+per-stream drops before analysis. Drop counts are aggregate per stream, not per CPU.
+
+## Ownership validation
+
+The variables are `last_app_id[core]`, `last_app_pid[core]`, and `app_owner_gen[core]`.
+A pending sample saves `app_id_at_request`, `pid_at_request`, and
+`app_owner_gen_at_request`, plus the old scheduling generation and a
+`request_pending` flag. These are separate from Caladan's existing policy state.
+No runtime or ksched modification is required.
+
+A standalone test exercises the actual IAS ownership helpers and collector with
+simulated ksched shared memory:
+
+```
+cc -D_GNU_SOURCE -std=gnu11 -O2 -Wall -Wno-unused-function -ffunction-sections -fdata-sections -Iinc -I. tests/telemetry/ownership_test.c base/bitmap.c -Wl,--gc-sections -o /tmp/ownership-test
+/tmp/ownership-test
+```
+
+It covers same-app park/resume, A -> B -> A, detach/PID reuse, late requests that
+must not be overwritten, and raw reads retained after ownership changes.
 
 ## Tests
 

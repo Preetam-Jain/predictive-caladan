@@ -10,3 +10,4 @@ iokerneld
 .cargo-local
 .rustup-local
 scripts/__pycache__/
+experiments/

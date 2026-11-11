@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream a version-4/5 Caladan telemetry stream file to CSV."""
+"""Stream a version-4/5/6/7 Caladan telemetry stream file to CSV."""
 from collections import namedtuple
 import argparse
 import csv
@@ -19,6 +19,27 @@ LAYOUTS = {
 }
 
 
+LLC_OWNERSHIP_LAYOUT = (
+    struct.Struct('<QQQQQQII'),
+    ('tsc', 'sched_gen_at_request', 'misses', 'app_id_at_request',
+     'app_owner_gen_at_request', 'app_owner_gen_at_collection', 'core', 'pid_at_request'),
+)
+
+
+LLC_SCHED_COLLECTION_LAYOUT = (
+    struct.Struct('<QQQQQQQII'),
+    LLC_OWNERSHIP_LAYOUT[1][:-2] + ('sched_gen_at_collection', 'core', 'pid_at_request'),
+)
+
+
+def record_layout(header):
+    if header.version >= 7 and header.stream_type == 2:
+        return LLC_SCHED_COLLECTION_LAYOUT
+    if header.version >= 6 and header.stream_type == 2:
+        return LLC_OWNERSHIP_LAYOUT
+    return LAYOUTS[header.stream_type]
+
+
 FileHeader = namedtuple('FileHeader', (
     'magic version header_bytes record_bytes stream_type cycles_per_us selector '
     'writer_core scheduler_core nr_cores flags bandwidth_multiplier produced dropped experiment_id'
@@ -30,11 +51,11 @@ def read_header(source):
     if len(raw) != HEADER.size:
         raise ValueError('truncated header')
     header = FileHeader._make(HEADER.unpack(raw))
-    if header.magic != b'CALATLM\0' or header.version not in (4, 5):
-        raise ValueError('unsupported capture format (requires version 4 or 5)')
+    if header.magic != b'CALATLM\0' or header.version not in (4, 5, 6, 7):
+        raise ValueError('unsupported capture format (requires version 4, 5, 6, or 7)')
     if header.stream_type not in LAYOUTS or (header.version == 4 and header.stream_type == 4):
         raise ValueError(f'unknown stream type {header.stream_type}')
-    layout, _ = LAYOUTS[header.stream_type]
+    layout, _ = record_layout(header)
     if (header.header_bytes != HEADER.size + header.nr_cores * 4
             or header.record_bytes != layout.size):
         raise ValueError('invalid sizes for versioned stream layout')
@@ -52,7 +73,7 @@ def read_header(source):
 
 
 def iter_records(source, header):
-    layout, _ = LAYOUTS[header.stream_type]
+    layout, _ = record_layout(header)
     records_remaining = header.produced
     records_per_chunk = max(1, 65536 // header.record_bytes)
     while records_remaining:
@@ -74,7 +95,7 @@ def decode(source, output):
           f'scheduler_cpu={header.scheduler_core} cores={cores} '
           f'bandwidth_multiplier={header.bandwidth_multiplier}', file=sys.stderr)
     csv_output = csv.writer(output)
-    csv_output.writerow(LAYOUTS[header.stream_type][1])
+    csv_output.writerow(record_layout(header)[1])
     csv_output.writerows(iter_records(source, header))
     print(f'completed: records={header.produced} dropped={header.dropped}', file=sys.stderr)
 

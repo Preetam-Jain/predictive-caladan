@@ -25,6 +25,27 @@ static DEFINE_BITMAP(ias_reserved_cores, NCPU);
 struct ias_data *cores[NCPU];
 /* the generation number (to detect context switches on a core) */
 uint64_t ias_gen[NCPU];
+/* Parking does not relinquish this telemetry ownership history. */
+uint64_t last_app_id[NCPU];
+uint64_t app_owner_gen[NCPU];
+uint32_t last_app_pid[NCPU];
+static uint64_t next_app_id;
+
+static void ias_assign_app_owner(struct ias_data *sd, unsigned int core)
+{
+	if (last_app_id[core] != sd->app_id) {
+		last_app_id[core] = sd->app_id;
+		app_owner_gen[core]++;
+	}
+	last_app_pid[core] = sd->p->pid;
+}
+
+static void ias_clear_app_owner(unsigned int core)
+{
+	last_app_id[core] = IAS_APP_NONE;
+	last_app_pid[core] = SCHED_PID_NONE;
+	app_owner_gen[core]++;
+}
 /* the current time in microseconds */
 uint64_t now_us;
 
@@ -100,6 +121,75 @@ static void ias_cleanup_core(unsigned int core)
 	cores[core] = NULL;
 }
 
+/* Original upstream Caladan implementation, retained for comparison. */
+// static int ias_attach(struct proc *p, struct sched_spec *sched_cfg)
+// {
+// 	struct ias_data *sd;
+// 	int i, core, sib;
+//
+// 	/* validate parameters */
+// 	if (!cfg.noht && sched_cfg->guaranteed_cores % 2 != 0) {
+// 		log_err("ias: tried to attach proc with odd number of guaranteed cores");
+// 		return -EINVAL;
+// 	}
+//
+// 	/* allocate and initialize process state */
+// 	sd = malloc(sizeof(*sd));
+// 	if (!sd)
+// 		return -ENOMEM;
+// 	memset(sd, 0, sizeof(*sd));
+// 	sd->p = p;
+// 	sd->threads_guaranteed = sched_cfg->guaranteed_cores;
+// 	sd->threads_max = sched_cfg->max_cores;
+// 	sd->threads_limit = sched_cfg->max_cores;
+// 	sd->is_lc = sched_cfg->priority == SCHED_PRIO_LC;
+// 	if (sd->is_lc)
+// 		sd->ht_punish_us = sched_cfg->ht_punish_us;
+// 	sd->qdelay_us = sched_cfg->qdelay_us;
+// 	sd->quantum_us = sched_cfg->quantum_us;
+// 	sd->threads_active = 0;
+// 	p->policy_data = (unsigned long)sd;
+// 	list_add(&all_procs, &sd->all_link);
+//
+// 	/* reserve priority cores */
+// 	i = sd->threads_guaranteed;
+// 	sd->has_core_resv = i > 0;
+// 	while (i > 0) {
+// 		core = bitmap_find_next_cleared(ias_reserved_cores, NCPU, 0);
+// 		if (core == NCPU)
+// 			goto fail_reserve;
+//
+// 		bitmap_set(sd->reserved_cores, core);
+// 		bitmap_set(ias_reserved_cores, core);
+// 		i--;
+// #ifdef IAS_DEBUG
+// 		owners[core] = p->pid;
+// #endif
+//
+// 		if (cfg.noht)
+// 			continue;
+//
+// 		sib = sched_siblings[core];
+// 		bitmap_set(sd->reserved_cores, sib);
+// 		bitmap_set(ias_reserved_cores, sib);
+// 		i--;
+// #ifdef IAS_DEBUG
+// 		owners[sib] = p->pid;
+// #endif
+// 	}
+//
+// 	return 0;
+//
+// fail_reserve:
+// 	log_err("ias: not enough cores available for reservation");
+// 	list_del_from(&all_procs, &sd->all_link);
+// 	bitmap_xor(ias_reserved_cores, ias_reserved_cores,
+// 		   sd->reserved_cores, NCPU);
+// 	free(sd);
+// 	return -ENOENT;
+// }
+
+/* Implementation with application ownership bookkeeping. */
 static int ias_attach(struct proc *p, struct sched_spec *sched_cfg)
 {
 	struct ias_data *sd;
@@ -111,11 +201,18 @@ static int ias_attach(struct proc *p, struct sched_spec *sched_cfg)
 		return -EINVAL;
 	}
 
+	/* Never reuse an application ID during this IOKernel lifetime. */
+	if (next_app_id == UINT64_MAX) {
+		log_err("ias: application ID space exhausted");
+		return -EOVERFLOW;
+	}
+
 	/* allocate and initialize process state */
 	sd = malloc(sizeof(*sd));
 	if (!sd)
 		return -ENOMEM;
 	memset(sd, 0, sizeof(*sd));
+	sd->app_id = ++next_app_id;
 	sd->p = p;
 	sd->threads_guaranteed = sched_cfg->guaranteed_cores;
 	sd->threads_max = sched_cfg->max_cores;
@@ -167,6 +264,27 @@ fail_reserve:
 	return -ENOENT;
 }
 
+/* Original upstream Caladan implementation, retained for comparison. */
+// static void ias_detach(struct proc *p)
+// {
+// 	struct ias_data *sd = (struct ias_data *)p->policy_data;
+// 	int i;
+//
+// 	list_del_from(&all_procs, &sd->all_link);
+// 	bitmap_xor(ias_reserved_cores, ias_reserved_cores,
+// 		   sd->reserved_cores, NCPU);
+//
+// 	for (i = 0; i < NCPU; i++) {
+// 		if (cores[i] == sd)
+// 			cores[i] = NULL;
+// 	}
+//
+// 	ias_unmark_congested(sd);
+//
+// 	free(sd);
+// }
+
+/* Implementation with application ownership bookkeeping. */
 static void ias_detach(struct proc *p)
 {
 	struct ias_data *sd = (struct ias_data *)p->policy_data;
@@ -177,6 +295,8 @@ static void ias_detach(struct proc *p)
 		   sd->reserved_cores, NCPU);
 
 	for (i = 0; i < NCPU; i++) {
+		if (last_app_id[i] == sd->app_id)
+			ias_clear_app_owner(i);
 		if (cores[i] == sd)
 			cores[i] = NULL;
 	}
@@ -236,6 +356,7 @@ static int ias_run_kthread_on_core(struct ias_data *sd, unsigned int core)
 
 	ias_cleanup_core(core);
 	cores[core] = sd;
+	ias_assign_app_owner(sd, core);
 	ias_gen[core]++;
 	telemetry_sched_event(core, sd->p->pid, ias_gen[core], SCHED_WORKER_SCHEDULED);
 	bitmap_clear(ias_idle_cores, core);
@@ -285,6 +406,7 @@ int ias_idle_placeholder_on_core(struct ias_data *sd, unsigned int core)
 
 	ias_cleanup_core(core);
 	cores[core] = sd;
+	ias_assign_app_owner(sd, core);
 	ias_gen[core]++;
 	telemetry_sched_event(core, sd->p->pid, ias_gen[core], SCHED_IDLE_PLACEHOLDER);
 	bitmap_set(ias_idle_cores, core);

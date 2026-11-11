@@ -27,6 +27,8 @@
 
 struct ias_data {
 	struct proc		*p;
+	/* Unique application lifetime ID; independent of PID reuse. */
+	uint64_t app_id;
 	unsigned int		is_congested:1;
 	unsigned int       	has_core_resv:1;
 	unsigned int		is_bwlimited:1;
@@ -64,6 +66,10 @@ struct ias_data {
 extern struct list_head all_procs;
 extern struct ias_data *cores[NCPU];
 extern uint64_t ias_gen[NCPU];
+#define IAS_APP_NONE 0ULL
+extern uint64_t last_app_id[NCPU];
+extern uint64_t app_owner_gen[NCPU];
+extern uint32_t last_app_pid[NCPU];
 extern uint64_t now_us;
 extern struct list_head congested_procs[NCPU + 1];
 extern uint64_t congested_lc_procs_nr;

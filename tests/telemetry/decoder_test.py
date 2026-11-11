@@ -16,6 +16,10 @@ RECORDS = {1: struct.pack('<QQ', 100, 99),
 
 def fixture(cores, stream_type=1, complete=True, version=4):
     record = RECORDS[stream_type]
+    if version >= 6 and stream_type == 2:
+        record = struct.pack('<QQQQQQII', 100, 9, 99, 123, 8, 8, 7, 42)
+    if version >= 7 and stream_type == 2:
+        record = struct.pack('<QQQQQQQII', 100, 9, 99, 123, 8, 8, 10, 7, 42)
     return (struct.pack('<8sIIIIdQIIIIdQQ16s', b'CALATLM\0', version,
                         96 + 4 * len(cores), len(record), stream_type, 2400.0,
                         0, 4, 0, len(cores), int(complete), 153600.0, 1, 17,
@@ -57,6 +61,19 @@ class DecoderTest(unittest.TestCase):
 
     def test_scheduler_record_not_allowed_in_version4(self):
         self.assertNotEqual(self.decode(fixture([], 4)).returncode, 0)
+
+    def test_version6_ownership_layout(self):
+        result = self.decode(fixture([], 2, version=6))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('app_owner_gen_at_request', result.stdout)
+        self.assertIn('app_owner_gen_at_collection', result.stdout)
+        self.assertIn('100,9,99,123,8,8,7,42', result.stdout)
+
+    def test_version7_collection_generation(self):
+        result = self.decode(fixture([], 2, version=7))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('sched_gen_at_collection', result.stdout)
+        self.assertIn('100,9,99,123,8,8,10,7,42', result.stdout)
 
     def test_incomplete(self):
         self.assertNotEqual(self.decode(fixture([], complete=False)).returncode, 0)
