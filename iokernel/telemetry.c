@@ -52,6 +52,24 @@ struct sched_event_record {
     uint16_t reason;
 };
 
+/* Queue contributions are cycles; identity is the runtime worker TID, even parked. */
+struct queue_record {
+    uint64_t tsc, runnable_cycles, rx_cycles, timer_cycles;
+    uint64_t directpath_cycles, storage_cycles, total_cycles;
+    uint32_t pid, tid, core, flags; /* flags: active=1, has_work=2, standing=4 */
+};
+/* Observations, not completed-task durations. Even RCU generations mean idle. */
+struct task_record {
+    uint64_t tsc, task_elapsed_us, kthread_elapsed_us;
+    uint32_t pid, tid, core, rcu_gen;
+};
+struct delay_record {
+    uint64_t tsc, rx_cycles;
+    double max_us, min_us, avg_us;
+    uint32_t pid, active_threads, flags, reserved;
+    /* flags: has_work=1, parked_busy=2, standing_queue=4 */
+};
+
 enum stream_type {
     STREAM_BW = 1,
     STREAM_LLC = 2,
@@ -93,9 +111,9 @@ _Static_assert(sizeof(struct bandwidth_record) == 16, "bandwidth record size ass
 _Static_assert(sizeof(struct llc_record) == 64, "llc record size assert failed");
 _Static_assert(sizeof(struct pmc_failure_record) == 24, "pmc failure record size assert failed");
 _Static_assert(sizeof(struct sched_event_record) == 24, "scheduler event record size assert failed");
-_Static_assert(sizeof(struct telemetry_queue_record) == 72, "queue record size assert failed");
-_Static_assert(sizeof(struct telemetry_task_record) == 40, "task record size assert failed");
-_Static_assert(sizeof(struct telemetry_delay_record) == 56, "delay record size assert failed");
+_Static_assert(sizeof(struct queue_record) == 72, "queue record size assert failed");
+_Static_assert(sizeof(struct task_record) == 40, "task record size assert failed");
+_Static_assert(sizeof(struct delay_record) == 56, "delay record size assert failed");
 _Static_assert(NCPU <= (uint32_t)UINT16_MAX + 1, "scheduler event CPU ID width assert failed");
 _Static_assert(sizeof(struct file_header) == 96, "file header size assert failed");
 _Static_assert(offsetof(struct file_header, cores) == sizeof(struct file_header),
@@ -160,21 +178,21 @@ static struct stream sched_stream = {
 static struct stream queue_stream = {
     .suffix = ".queue.bin",
     .type = STREAM_QUEUE,
-    .record_bytes = sizeof(struct telemetry_queue_record),
+    .record_bytes = sizeof(struct queue_record),
     .capacity = SCHED_EVENT_CAPACITY,
     .fd = -1,
 };
 static struct stream task_stream = {
     .suffix = ".task.bin",
     .type = STREAM_TASK,
-    .record_bytes = sizeof(struct telemetry_task_record),
+    .record_bytes = sizeof(struct task_record),
     .capacity = SCHED_EVENT_CAPACITY,
     .fd = -1,
 };
 static struct stream delay_stream = {
     .suffix = ".delay.bin",
     .type = STREAM_DELAY,
-    .record_bytes = sizeof(struct telemetry_delay_record),
+    .record_bytes = sizeof(struct delay_record),
     .capacity = SCHED_EVENT_CAPACITY,
     .fd = -1,
 };
@@ -546,17 +564,54 @@ void telemetry_sched_event(uint32_t core, uint32_t pid, uint64_t gen,
     submit(&sched_stream, &record);
 }
 
-void telemetry_queue(const struct telemetry_queue_record *record)
+void telemetry_queue(uint64_t tsc, uint64_t runnable_cycles, uint64_t rx_cycles,
+                     uint64_t timer_cycles, uint64_t directpath_cycles,
+                     uint64_t storage_cycles, uint64_t total_cycles, uint32_t pid,
+                     uint32_t tid, uint32_t core, uint32_t flags)
 {
-    submit(&queue_stream, record);
+    struct queue_record record = {
+        .tsc = tsc,
+        .runnable_cycles = runnable_cycles,
+        .rx_cycles = rx_cycles,
+        .timer_cycles = timer_cycles,
+        .directpath_cycles = directpath_cycles,
+        .storage_cycles = storage_cycles,
+        .total_cycles = total_cycles,
+        .pid = pid,
+        .tid = tid,
+        .core = core,
+        .flags = flags,
+    };
+    submit(&queue_stream, &record);
 }
 
-void telemetry_task(const struct telemetry_task_record *record)
+void telemetry_task(uint64_t tsc, uint64_t task_elapsed_us, uint64_t kthread_elapsed_us,
+                    uint32_t pid, uint32_t tid, uint32_t core, uint32_t rcu_gen)
 {
-    submit(&task_stream, record);
+    struct task_record record = {
+        .tsc = tsc,
+        .task_elapsed_us = task_elapsed_us,
+        .kthread_elapsed_us = kthread_elapsed_us,
+        .pid = pid,
+        .tid = tid,
+        .core = core,
+        .rcu_gen = rcu_gen,
+    };
+    submit(&task_stream, &record);
 }
 
-void telemetry_delay(const struct telemetry_delay_record *record)
+void telemetry_delay(uint64_t tsc, uint64_t rx_cycles, double max_us, double min_us,
+                     double avg_us, uint32_t pid, uint32_t active_threads, uint32_t flags)
 {
-    submit(&delay_stream, record);
+    struct delay_record record = {
+        .tsc = tsc,
+        .rx_cycles = rx_cycles,
+        .max_us = max_us,
+        .min_us = min_us,
+        .avg_us = avg_us,
+        .pid = pid,
+        .active_threads = active_threads,
+        .flags = flags,
+    };
+    submit(&delay_stream, &record);
 }

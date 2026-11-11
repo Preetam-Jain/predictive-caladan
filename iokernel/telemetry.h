@@ -26,23 +26,14 @@ enum sched_event_reason {
 void telemetry_sched_event(uint32_t core, uint32_t pid, uint64_t gen,
                            enum sched_event_reason reason);
 
-/* Queue contributions are cycles; identity is the runtime worker TID, even parked. */
-struct telemetry_queue_record {
-    uint64_t tsc, runnable_cycles, rx_cycles, timer_cycles;
-    uint64_t directpath_cycles, storage_cycles, total_cycles;
-    uint32_t pid, tid, core, flags; /* flags: active=1, has_work=2, standing=4 */
-};
-/* Observations, not completed-task durations. Even RCU generations mean idle. */
-struct telemetry_task_record {
-    uint64_t tsc, task_elapsed_us, kthread_elapsed_us;
-    uint32_t pid, tid, core, rcu_gen;
-};
-struct telemetry_delay_record {
-    uint64_t tsc, rx_cycles;
-    double max_us, min_us, avg_us;
-    uint32_t pid, active_threads, flags, reserved;
-    /* flags: has_work=1, parked_busy=2, standing_queue=4 */
-};
-void telemetry_queue(const struct telemetry_queue_record *record);
-void telemetry_task(const struct telemetry_task_record *record);
-void telemetry_delay(const struct telemetry_delay_record *record);
+/* Queue delays are cycles; flags: active=1, has_work=2, standing_queue=4. */
+void telemetry_queue(uint64_t tsc, uint64_t runnable_cycles, uint64_t rx_cycles,
+                     uint64_t timer_cycles, uint64_t directpath_cycles,
+                     uint64_t storage_cycles, uint64_t total_cycles, uint32_t pid,
+                     uint32_t tid, uint32_t core, uint32_t flags);
+/* Observed elapsed time, not completed-task duration. Even RCU generations mean idle. */
+void telemetry_task(uint64_t tsc, uint64_t task_elapsed_us, uint64_t kthread_elapsed_us,
+                    uint32_t pid, uint32_t tid, uint32_t core, uint32_t rcu_gen);
+/* Process flags: has_work=1, parked_busy=2, standing_queue=4. */
+void telemetry_delay(uint64_t tsc, uint64_t rx_cycles, double max_us, double min_us,
+                     double avg_us, uint32_t pid, uint32_t active_threads, uint32_t flags);
