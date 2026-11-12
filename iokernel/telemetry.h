@@ -26,10 +26,14 @@ enum sched_event_reason {
 void telemetry_sched_event(uint32_t core, uint32_t pid, uint64_t gen,
                            enum sched_event_reason reason);
 
-/* Queue delays are cycles; flags: active=1, has_work=2, standing_queue=4. */
+/* Queue delays are TSC ticks. Flags: active=1, has_work=2, standing_queue=4.
+ * standing_queue includes earlier workers polled for this process.
+ * VFIO RX delay is process-level only.
+ * A parked worker's core is not a current CPU assignment.
+ */
 void telemetry_queue(uint64_t tsc, uint64_t runnable_cycles, uint64_t rx_cycles,
                      uint64_t timer_cycles, uint64_t directpath_cycles,
-                     uint64_t storage_cycles, uint64_t total_cycles, uint32_t pid,
+                     uint64_t storage_cycles, uint32_t pid,
                      uint32_t tid, uint32_t core, uint32_t flags);
 /* Observed elapsed time, not completed-task duration. Even RCU generations mean idle. */
 void telemetry_task(uint64_t tsc, uint64_t task_elapsed_us, uint64_t kthread_elapsed_us,

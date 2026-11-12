@@ -493,6 +493,13 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 {
 	uint32_t cur_tail, cur_head, last_head, last_tail;
 	uint64_t tmp;
+	uint64_t prev_delay = *thread_delay;
+	uint64_t runnable_delay_cycles;
+	uint64_t rx_delay_cycles;
+	uint64_t timer_delay_cycles;
+	uint64_t directpath_delay_cycles = 0;
+	uint64_t storage_delay_cycles;
+	uint32_t flags = 0;
 
 	/* UTHREAD: measure delay */
 	last_tail = th->last_rq_tail;
@@ -506,12 +513,14 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 	*has_work |= cur_head != cur_tail;
 	*standing_queue |= wraps_lt(cur_tail, last_head);
 
-	/* Telemetry: retain the runnable-thread queue contribution separately. */
 	/* UTHREAD: update new queueing delay signal */
 	if (cur_head != cur_tail) {
 		tmp = ACCESS_ONCE(th->q_ptrs->oldest_tsc);
 		*thread_delay += calc_delay_tsc(tmp);
 	}
+
+	runnable_delay_cycles = *thread_delay - prev_delay;
+	prev_delay = *thread_delay;
 
 	/* RXQ: measure delay */
 	last_tail = th->last_rxq_tail;
@@ -525,7 +534,6 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 	*has_work |= cur_head != cur_tail;
 	*standing_queue |= wraps_lt(cur_tail, last_head);
 
-	/* Telemetry: retain the software receive-queue contribution separately. */
 	/* RXQ: update new queueing delay signal */
 	/* FIXME: this only approximates queueing delay */
 	if (cur_head == cur_tail)
@@ -534,7 +542,9 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 		th->rxq_busy_since = cur_tsc;
 	 *thread_delay += calc_delay_tsc(th->rxq_busy_since);
 
-	/* Telemetry: retain the overdue-timer contribution separately. */
+	rx_delay_cycles = *thread_delay - prev_delay;
+	prev_delay = *thread_delay;
+
 	/* TIMER: measure delay and update signals */
 	tmp = *next_timer = ACCESS_ONCE(th->q_ptrs->next_timer_tsc);
 	if (tmp <= cur_tsc) {
@@ -543,23 +553,32 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 	}
 	*thread_delay += calc_delay_tsc(tmp);
 
+	timer_delay_cycles = *thread_delay - prev_delay;
+
 	/*
 	 * DIRECTPATH: measure delay and update signals.
 	 * ignore the busy signal here.
 	 */
-	/* Telemetry: retain Directpath hardware-queue delay, including rxq_delay. */
 	if (p->has_directpath && !p->has_vfio_directpath) {
 		if (th->directpath_hwq.hwq_type == HWQ_MLX5_QSTEER) {
 			bool a, b;
-			sched_measure_hardware_delay(th, &th->directpath_hwq, true, &a, &b, rxq_delay);
+			/* Original upstream Caladan implementation:
+			 * sched_measure_hardware_delay(th, &th->directpath_hwq, true, &a, &b, rxq_delay);
+			 */
+			/* Capture this queue's contribution without reusing a previous queue's delay. */
+			sched_measure_hardware_delay(th, &th->directpath_hwq, true, &a, &b, &directpath_delay_cycles);
+			if (directpath_delay_cycles)
+				*rxq_delay = directpath_delay_cycles;
 		} else {
 			tmp = 0;
 			sched_measure_hardware_delay(th, &th->directpath_hwq, true, has_work, standing_queue, &tmp);
 			*thread_delay += tmp;
+			directpath_delay_cycles = tmp;
 		}
 	}
 
-	/* Telemetry: retain the storage completion-queue contribution separately. */
+	prev_delay = *thread_delay;
+
 	if (p->has_storage) {
 		/* STORAGE: measure delay and update signals */
 		tmp = 0;
@@ -567,6 +586,19 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 			                         standing_queue, &tmp);
 		*thread_delay += tmp;
 	}
+	storage_delay_cycles = *thread_delay - prev_delay;
+
+	if (th->active)
+		flags |= 0b001U;
+	if (*has_work)
+		flags |= 0b010U;
+	if (*standing_queue)
+		flags |= 0b100U;
+
+	telemetry_queue(cur_tsc, runnable_delay_cycles, rx_delay_cycles,
+	                timer_delay_cycles, directpath_delay_cycles, storage_delay_cycles,
+	                p->pid, th->tid, th->core, flags);
+
 }
 
 #define EWMA_WEIGHT     0.1f
@@ -632,7 +664,6 @@ static void sched_measure_delay(struct proc *p)
 
 		sched_measure_kthread_delay(p, th, &delay, &rxq_delay, &busy,
 			                        &dl.standing_queue, &next_timer_tsc);
-		/* Telemetry: the polled worker's combined delay is available here. */
 
 		consumed_strides += ACCESS_ONCE(th->q_ptrs->directpath_strides_consumed);
 
@@ -645,6 +676,9 @@ static void sched_measure_delay(struct proc *p)
 
 		if (th->active) {
 			sched_update_kthread_metrics(th, busy);
+			telemetry_task(cur_tsc, th->metrics.uthread_elapsed_us,
+			               th->metrics.kthread_elapsed_us, p->pid, th->tid,
+			               th->core, th->metrics.rcu_gen);
 			if (delay < dl.min_delay_us) {
 				dl.min_delay_us = delay;
 				dl.min_delay_core = th->core;
@@ -657,7 +691,6 @@ static void sched_measure_delay(struct proc *p)
 
 
 	bool directpath_armed = true;
-	/* Telemetry: retain the process-level VFIO Directpath receive delay. */
 	if (p->has_vfio_directpath) {
 		bool do_arm = nr_procs > PROC_STANDARD_POLL_THRESH;
 		directpath_armed = directpath_poll_proc(p, &rxq_delay, cur_tsc, do_arm);
@@ -697,6 +730,10 @@ static void sched_measure_delay(struct proc *p)
 	dl.avg_delay_us /= (double)(cycles_per_us * sched_threads_active(p));
 
 	/* Telemetry: capture the final process delay and flags before policy notification. */
+	telemetry_delay(cur_tsc, rxq_delay, dl.max_delay_us, dl.min_delay_us,
+	                dl.avg_delay_us, p->pid, sched_threads_active(p),
+	                (dl.has_work ? 1U : 0U) | (dl.parked_thread_busy ? 2U : 0U) |
+	                (dl.standing_queue ? 4U : 0U));
 	/* report delay back to runtime */
 	sched_report_metrics(p, dl.max_delay_us);
 

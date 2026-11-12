@@ -75,6 +75,21 @@ class DecoderTest(unittest.TestCase):
         self.assertIn('sched_gen_at_collection', result.stdout)
         self.assertIn('100,9,99,123,8,8,10,7,42', result.stdout)
 
+    def test_version8_streams(self):
+        new_records = {
+            5: struct.pack('<6Q4I', 100, 1, 2, 3, 4, 5, 42, 43, 7, 3),
+            6: struct.pack('<3Q4I', 100, 12, 34, 42, 43, 7, 9),
+            7: struct.pack('<2Q3d4I', 100, 200, 12.5, 1.5, 7.5, 42, 2, 5, 0),
+        }
+        for kind, record in new_records.items():
+            with self.subTest(kind=kind):
+                header = bytearray(fixture([], version=8)[:96])
+                struct.pack_into('<II', header, 16, len(record), kind)
+                result = self.decode(header + record)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                struct.pack_into('<I', header, 8, 7)
+                self.assertNotEqual(self.decode(header + record).returncode, 0)
+
     def test_incomplete(self):
         self.assertNotEqual(self.decode(fixture([], complete=False)).returncode, 0)
 

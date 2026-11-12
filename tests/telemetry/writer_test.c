@@ -27,6 +27,15 @@ static void emit_sample(struct stream *stream, uint64_t index)
     case STREAM_PMC_FAILURE:
         telemetry_pmc_failure(7, index, index + 1);
         break;
+    case STREAM_QUEUE:
+        telemetry_queue(index + 1, 1, 2, 3, 4, 5, 42, 43, 7, 3);
+        break;
+    case STREAM_TASK:
+        telemetry_task(index + 1, 12, 34, 42, 43, 7, 9);
+        break;
+    case STREAM_DELAY:
+        telemetry_delay(index + 1, 100, 12.5, 1.5, 7.5, 42, 2, 5);
+        break;
     case STREAM_SCHED:
         telemetry_sched_event(7, 42, index, sched_reasons[index % ARRAY_SIZE(sched_reasons)]);
         break;
@@ -37,7 +46,7 @@ static void verify_file(struct stream *stream)
 {
     char *path;
     struct file_header header;
-    unsigned char record[sizeof(struct llc_record)];
+    unsigned char record[sizeof(struct queue_record)];
     assert(asprintf(&path, "%s%s", telemetry_path, stream->suffix) >= 0);
     FILE *file = fopen(path, "rb");
     assert(file);
@@ -76,6 +85,25 @@ static void verify_file(struct stream *stream)
             struct pmc_failure_record sample;
             memcpy(&sample, record, sizeof(sample));
             assert(sample.gen == index && sample.core == 7 && sample.reason == PMC_PENDING);
+        } else if (stream->type == STREAM_QUEUE) {
+            struct queue_record sample;
+            memcpy(&sample, record, sizeof(sample));
+            assert(sample.runnable_cycles == 1 && sample.rx_cycles == 2);
+            assert(sample.timer_cycles == 3 && sample.directpath_cycles == 4);
+            assert(sample.storage_cycles == 5);
+            assert(sample.pid == 42 && sample.tid == 43 && sample.core == 7 && sample.flags == 3);
+        } else if (stream->type == STREAM_TASK) {
+            struct task_record sample;
+            memcpy(&sample, record, sizeof(sample));
+            assert(sample.task_elapsed_us == 12 && sample.kthread_elapsed_us == 34);
+            assert(sample.pid == 42 && sample.tid == 43 && sample.core == 7 && sample.rcu_gen == 9);
+        } else if (stream->type == STREAM_DELAY) {
+            struct delay_record sample;
+            memcpy(&sample, record, sizeof(sample));
+            assert(sample.rx_cycles == 100 && sample.max_us == 12.5);
+            assert(sample.min_us == 1.5 && sample.avg_us == 7.5);
+            assert(sample.pid == 42 && sample.active_threads == 2 && sample.flags == 5);
+            assert(sample.reserved == 0);
         } else {
             struct sched_event_record sample;
             memcpy(&sample, record, sizeof(sample));
@@ -104,6 +132,7 @@ int main(int argc, char **argv)
     llc_stream.capacity = 2048;
     failure_stream.capacity = 64;
     sched_stream.capacity = 128;
+    queue_stream.capacity = task_stream.capacity = delay_stream.capacity = 128;
     for (size_t i = 0; i < ARRAY_SIZE(streams); i++)
         assert(!stream_open(streams[i]));
     active = true;

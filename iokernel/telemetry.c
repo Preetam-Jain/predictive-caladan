@@ -55,7 +55,7 @@ struct sched_event_record {
 /* Queue contributions are cycles; identity is the runtime worker TID, even parked. */
 struct queue_record {
     uint64_t tsc, runnable_cycles, rx_cycles, timer_cycles;
-    uint64_t directpath_cycles, storage_cycles, total_cycles;
+    uint64_t directpath_cycles, storage_cycles;
     uint32_t pid, tid, core, flags; /* flags: active=1, has_work=2, standing=4 */
 };
 /* Observations, not completed-task durations. Even RCU generations mean idle. */
@@ -111,7 +111,7 @@ _Static_assert(sizeof(struct bandwidth_record) == 16, "bandwidth record size ass
 _Static_assert(sizeof(struct llc_record) == 64, "llc record size assert failed");
 _Static_assert(sizeof(struct pmc_failure_record) == 24, "pmc failure record size assert failed");
 _Static_assert(sizeof(struct sched_event_record) == 24, "scheduler event record size assert failed");
-_Static_assert(sizeof(struct queue_record) == 72, "queue record size assert failed");
+_Static_assert(sizeof(struct queue_record) == 64, "queue record size assert failed");
 _Static_assert(sizeof(struct task_record) == 40, "task record size assert failed");
 _Static_assert(sizeof(struct delay_record) == 56, "delay record size assert failed");
 _Static_assert(NCPU <= (uint32_t)UINT16_MAX + 1, "scheduler event CPU ID width assert failed");
@@ -566,7 +566,7 @@ void telemetry_sched_event(uint32_t core, uint32_t pid, uint64_t gen,
 
 void telemetry_queue(uint64_t tsc, uint64_t runnable_cycles, uint64_t rx_cycles,
                      uint64_t timer_cycles, uint64_t directpath_cycles,
-                     uint64_t storage_cycles, uint64_t total_cycles, uint32_t pid,
+                     uint64_t storage_cycles, uint32_t pid,
                      uint32_t tid, uint32_t core, uint32_t flags)
 {
     struct queue_record record = {
@@ -576,7 +576,6 @@ void telemetry_queue(uint64_t tsc, uint64_t runnable_cycles, uint64_t rx_cycles,
         .timer_cycles = timer_cycles,
         .directpath_cycles = directpath_cycles,
         .storage_cycles = storage_cycles,
-        .total_cycles = total_cycles,
         .pid = pid,
         .tid = tid,
         .core = core,

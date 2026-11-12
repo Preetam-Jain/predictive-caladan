@@ -153,7 +153,7 @@ def summarize(prefix):
                 elif suffix == 'pmc-failure':
                     _, _, core, reason = record
                     failure_counts[core, reason] += 1
-                else:
+                elif suffix == 'sched':
                     _, _, pid, core, reason = record
                     scheduler_events[core, pid, reason] += 1
 
