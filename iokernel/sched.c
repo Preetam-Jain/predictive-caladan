@@ -562,9 +562,6 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 	if (p->has_directpath && !p->has_vfio_directpath) {
 		if (th->directpath_hwq.hwq_type == HWQ_MLX5_QSTEER) {
 			bool a, b;
-			/* Original upstream Caladan implementation:
-			 * sched_measure_hardware_delay(th, &th->directpath_hwq, true, &a, &b, rxq_delay);
-			 */
 			/* Capture this queue's contribution without reusing a previous queue's delay. */
 			sched_measure_hardware_delay(th, &th->directpath_hwq, true, &a, &b, &directpath_delay_cycles);
 			if (directpath_delay_cycles)
@@ -814,102 +811,7 @@ rewake:
 /**
  * sched_poll - advance the scheduler during each poll loop iteration
  */
-/* Original Caladan implementation (HEAD), retained for comparison. */
-// void sched_poll(void)
-// {
-// 	static uint64_t last_time;
-// 	DEFINE_BITMAP(idle, NCPU);
-// 	struct core_state *s;
-// 	uint64_t now;
-// 	int i, core, idle_cnt = 0;
-// 	struct proc *p, *p_next;
-//
-// 	/*
-// 	 * slow pass --- runs every IOKERNEL_POLL_INTERVAL
-// 	 */
-//
-// 	cur_tsc = rdtsc();
-// 	now = (cur_tsc - start_tsc) / cycles_per_us;
-// 	if (cur_tsc - last_time >= IOKERNEL_POLL_INTERVAL * cycles_per_us) {
-//
-// 		STAT_INC(SCHED_RUN, 1);
-//
-// 		/* retrieve current network device tick */
-// 		hw_timestamp_update();
-//
-// 		proc_timer_run(now);
-//
-// 		last_time = cur_tsc;
-// 		list_for_each_safe(&poll_list, p, p_next, link) {
-// 			prefetch(p_next);
-// 			sched_measure_delay(p);
-// 		}
-// 	} else if (!cfg.noidlefastwake && nr_procs < PROC_STANDARD_POLL_THRESH) {
-// 		/* check if any idle directpath runtimes have received I/Os */
-// 		for (i = 0; i < dp.nr_clients; i++) {
-// 			p = dp.clients[i];
-// 			if (p->has_directpath && sched_threads_active(p) == 0)
-// 				sched_detect_io_for_idle_runtime(p);
-// 		}
-// 	}
-//
-// 	/*
-// 	 * fast pass --- runs every poll loop
-// 	 */
-//
-// 	bitmap_init(idle, NCPU, false);
-// 	sched_for_each_allowed_core(core, i) {
-// 		s = &state[core];
-//
-// 		/* check if a pending context switch finished */
-// 		if (s->wait && ksched_poll_run_done(core)) {
-// 			if (s->last_th) {
-// 				sched_disable_kthread(s->last_th, core);
-// 				proc_put(s->last_th->p);
-// 				s->last_th = NULL;
-// 			}
-// 			if (s->pending) {
-// 				struct thread *th = s->pending_th;
-//
-// 				s->pending_th = NULL;
-// 				s->pending = false;
-// 				if (s->cur_th)
-// 					ACCESS_ONCE(s->cur_th->q_ptrs->cede_gen) =
-// 						s->cur_th->wake_gen;
-// 				ksched_enqueue_intr(core, KSCHED_INTR_CEDE);
-// 				STAT_INC(PREEMPT, 1);
-// 				ksched_run(core, th ? th->tid : 0);
-// 				s->last_th = s->cur_th;
-// 				s->cur_th = th;
-// 			} else {
-// 				s->wait = false;
-// 			}
-// 		}
-//
-// 		/* check if a core went idle */
-// 		if (!s->wait && !s->idle && ksched_poll_idle(core)) {
-// 			if (s->cur_th) {
-// 				if (!cfg.vfio_directpath && sched_try_fast_rewake(s->cur_th) == 0)
-// 					continue;
-// 				sched_disable_kthread(s->cur_th, core);
-// 				proc_put(s->cur_th->p);
-// 				s->cur_th = NULL;
-// 			}
-// 			s->idle = true;
-// 			bitmap_set(idle, core);
-// 			idle_cnt++;
-// 		}
-// 	}
-//
-// 	/*
-// 	 * final pass --- let the scheduler policy decide how to respond
-// 	 */
-//
-// 	sched_ops->sched_poll(now, idle_cnt, idle);
-// 	ksched_send_intrs();
-// }
 
-/* Telemetry implementation. */
 void sched_poll(void)
 {
 	static uint64_t last_time;
@@ -1114,86 +1016,7 @@ static int sched_scan_node(int node)
  *
  * Returns 0 if successful, otherwise fail.
  */
-/* Original Caladan implementation (HEAD), retained for comparison. */
-// int sched_init(void)
-// {
-// 	int i;
-// 	bool valid = true;
-//
-// 	bitmap_init(sched_allowed_cores, cpu_count, false);
-//
-// 	/*
-// 	 * first pass: scan and log CPUs
-// 	 */
-//
-// 	log_info("sched: CPU configuration...");
-// 	for (i = 0; i < numa_count; i++) {
-// 		printf("\tnode %d: ", i);
-// 		if (sched_scan_node(i) != 0)
-// 			valid = false;
-// 		printf("\n");
-// 		fflush(stdout);
-// 	}
-// 	if (!valid)
-// 		return -EINVAL;
-//
-// 	/*
-// 	 * second pass: determine available CPUs
-// 	 */
-//
-// 	for (i = 0; i < cpu_count; i++) {
-// 		if (managed_numa_node != -1 &&
-// 		    cpu_info_tbl[i].package != managed_numa_node &&
-// 		    sched_ops != &numa_ops)
-// 			continue;
-//
-// 		if (allowed_cores_supplied &&
-// 		    !bitmap_test(input_allowed_cores, i))
-// 			continue;
-// 		bitmap_set(sched_allowed_cores, i);
-// 	}
-// 	/* check for minimum number of cores required */
-// 	i = bitmap_popcount(sched_allowed_cores, NCPU);
-// 	if (i < 3 + !cfg.noht) {
-// 		log_err("sched: %d is not enough cores\n", i);
-// 		return -EINVAL;
-// 	}
-//
-// 	/*
-// 	 * third pass: reserve cores for iokernel and system
-// 	 */
-//
-// 	sched_ctrl_core = bitmap_find_next_set(sched_allowed_cores, NCPU, 0);
-// 	if (cfg.noht)
-// 		sched_dp_core = bitmap_find_next_set(sched_allowed_cores, NCPU, sched_ctrl_core + 1);
-// 	else
-// 		sched_dp_core = sched_siblings[sched_ctrl_core];
-// 	bitmap_clear(sched_allowed_cores, sched_ctrl_core);
-// 	bitmap_clear(sched_allowed_cores, sched_dp_core);
-// 	log_info("sched: dataplane on %d, control on %d",
-// 		 sched_dp_core, sched_ctrl_core);
-//
-// 	/* check if configuration disables hyperthreads */
-// 	if (cfg.noht) {
-// 		for (i = 0; i < NCPU; i++) {
-// 			if (!bitmap_test(sched_allowed_cores, i))
-// 				continue;
-//
-// 			if (sched_siblings[i] == NCPU)
-// 				continue;
-//
-// 			bitmap_clear(sched_allowed_cores, sched_siblings[i]);
-// 		}
-// 	}
-//
-// 	/* generate polling arrays */
-// 	bitmap_for_each_set(sched_allowed_cores, NCPU, i)
-// 		sched_cores_tbl[sched_cores_nr++] = i;
-//
-// 	return 0;
-// }
 
-/* Telemetry implementation. */
 int sched_init(void)
 {
 	int i;

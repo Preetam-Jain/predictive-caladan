@@ -21,7 +21,12 @@
 #include "sched.h"
 
 #define LOG_INTERVAL_US		(1000 * 1000)
-struct iokernel_cfg cfg;
+/* Controllers require explicit startup opt-in. */
+struct iokernel_cfg cfg = {
+	.ht_intervention = false,
+	.timesharing = false,
+	.core_allocation = false,
+};
 struct dataplane dp;
 
 int dataplane_mode;
@@ -44,33 +49,6 @@ pthread_barrier_t init_barrier;
 	{__cstr(name), &name ## _init}
 
 /* iokernel subsystem initialization */
-/* Original initialization table, retained for comparison. */
-// static const struct init_entry iok_init_handlers[] = {
-// 	/* base */
-// 	IOK_INITIALIZER(base),
-//
-// 	/* general iokernel */
-// 	IOK_INITIALIZER(ksched),
-// 	IOK_INITIALIZER(sched),
-// 	IOK_INITIALIZER(simple),
-// 	IOK_INITIALIZER(numa),
-// 	IOK_INITIALIZER(ias),
-// 	IOK_INITIALIZER(proc_timer),
-//
-// 	/* control plane */
-// 	IOK_INITIALIZER(control),
-//
-// 	/* data plane */
-// 	IOK_INITIALIZER(dpdk),
-// 	IOK_INITIALIZER(rx),
-// 	IOK_INITIALIZER(tx),
-// 	IOK_INITIALIZER(dp_clients),
-// 	IOK_INITIALIZER(dpdk_late),
-// 	IOK_INITIALIZER(directpath),
-// 	IOK_INITIALIZER(hw_timestamp),
-// 	IOK_INITIALIZER(dma),
-//
-// };
 
 /* Initialization table with telemetry writer startup appended. */
 static const struct init_entry iok_init_handlers[] = {
@@ -209,18 +187,13 @@ void dataplane_loop(void)
 	}
 }
 
-/* Original Caladan implementation (HEAD), retained for comparison. */
-// static void print_usage(void)
-// {
-// 	printf("usage: POLICY [noht/core_list/nobw/mutualpair]\n");
-// 	printf("\tsimple: a simplified scheduler policy intended for testing\n");
-// 	printf("\tias: the Caladan scheduler policy (manages CPU interference)\n");
-// 	printf("\tnuma: an incomplete and experimental policy for NUMA architectures\n");
-// }
 
-/* Telemetry implementation. */
 static void print_usage(void)
 {
+    printf("  bw_intervention on|off (default off)\n");
+    printf("  ht_intervention on|off (default off)\n");
+    printf("  timesharing on|off (default off)\n");
+    printf("  core_allocation on|off (default off; off fixes guaranteed_cores)\n");
     printf("  telemetry CPU PREFIX SECONDS (PREFIX=- reserves core only)\n");
 	printf("usage: POLICY [noht/core_list/nobw/mutualpair]\n");
 	printf("\tsimple: a simplified scheduler policy intended for testing\n");
@@ -228,151 +201,11 @@ static void print_usage(void)
 	printf("\tnuma: an incomplete and experimental policy for NUMA architectures\n");
 }
 
-/* Original Caladan implementation (HEAD), retained for comparison. */
-// int main(int argc, char *argv[])
-// {
-// 	int i, ret;
-// 	struct utsname utsname;
-//
-// 	if (getuid() != 0) {
-// 		fprintf(stderr, "Error: please run as root\n");
-// 		return -EPERM;
-// 	}
-//
-// 	if (argc >= 2) {
-// 		if (!strcmp(argv[1], "simple")) {
-// 			sched_ops = &simple_ops;
-// 		} else if (!strcmp(argv[1], "numa")) {
-// 			sched_ops = &numa_ops;
-// 			managed_numa_node = -1;
-// 		} else if (!strcmp(argv[1], "ias")) {
-// 			sched_ops = &ias_ops;
-// 		} else {
-// 			print_usage();
-// 			return -EINVAL;
-// 		}
-// 	} else {
-// 		sched_ops = &ias_ops;
-// 	}
-//
-// 	for (i = 2; i < argc; i++) {
-// 		if (!strcmp(argv[i], "noht")) {
-// 			cfg.noht = true;
-// 		} else if (!strcmp(argv[i], "nobw")) {
-// 			cfg.nobw = true;
-// 		} else if (!strcmp(argv[i], "no_hw_qdel")) {
-// 			cfg.no_hw_qdel = true;
-// 		} else if (!strcmp(argv[i], "stats")) {
-// 			stat_logging = true;
-// 		} else if (!strcmp(argv[i], "selfpair")) {
-// 			cfg.ias_prefer_selfpair = true;
-// 		} else if (!strcmp(argv[i], "vfioprealloc")) {
-// 			if (i == argc - 1) {
-// 				fprintf(stderr, "missing vfioprealloc argument\n");
-// 				return -EINVAL;
-// 			}
-// 			char *token = strtok(argv[++i], ":");
-// 			nr_vfio_prealloc = atoi(token);
-// 			token = strtok(NULL, ":");
-// 			if (!token) continue;
-// 			vfio_prealloc_nrqs = atoi(token);
-// 			token = strtok(NULL, ":");
-// 			if (!token) continue;
-// 			vfio_prealloc_rmp = atoi(token);
-// 		} else if (!strcmp(argv[i], "vfio")) {
-// #ifndef DIRECTPATH
-// 			log_err("please recompile with CONFIG_DIRECTPATH=y");
-// 			return -EINVAL;
-// #endif
-// 			cfg.vfio_directpath = true;
-// 		} else if (!strcmp(argv[i], "bwlimit")) {
-// 			if (i == argc - 1) {
-// 				fprintf(stderr, "missing bwlimit argument\n");
-// 				return -EINVAL;
-// 			}
-// 			cfg.ias_bw_limit = atof(argv[++i]);
-// 			log_info("setting bwlimit to %.5f", cfg.ias_bw_limit);
-// 		} else if (!strcmp(argv[i], "nicpci")) {
-// 			if (i == argc - 1) {
-// 				fprintf(stderr, "missing nicpci argument\n");
-// 				return -EINVAL;
-// 			}
-// 			nic_pci_addr_str = argv[++i];
-// 			ret = pci_str_to_addr(nic_pci_addr_str, &nic_pci_addr);
-// 			if (ret) {
-// 				log_err("invalid pci address: %s", nic_pci_addr_str);
-// 				return -EINVAL;
-// 			}
-// 		} else if (!strcmp(argv[i], "numanode")) {
-// 			if (sched_ops == &numa_ops) {
-// 				fprintf(stderr, "Can't combine numanode argument with numa scheduler");
-// 				return -EINVAL;
-// 			}
-// 			if (i == argc - 1) {
-// 				fprintf(stderr, "missing numanode argument\n");
-// 				return -EINVAL;
-// 			}
-// 			managed_numa_node = atoi(argv[++i]);
-// 		} else if (!strcmp(argv[i], "noidlefastwake")) {
-// 			cfg.noidlefastwake = true;
-// 		} else if (!strcmp(argv[i], "dpactiverss")) {
-// 			cfg.directpath_active_rss = true;
-// 		} else if (!strcmp(argv[i], "nohugepages")) {
-// 			cfg.no_hugepages = true;
-// 			cfg_transparent_hugepages_enabled = true;
-// 		} else if (!strcmp(argv[i], "--")) {
-// 			dpdk_argv = &argv[i+1];
-// 			dpdk_argc = argc - i - 1;
-// 			break;
-// 		} else if (string_to_bitmap(argv[i], input_allowed_cores, NCPU)) {
-// 			fprintf(stderr, "invalid cpu list: %s\n", argv[i]);
-// 			fprintf(stderr, "example list: 0-24,26-48:2,49-255\n");
-// 			return -EINVAL;
-// 		} else {
-// 			allowed_cores_supplied = true;
-// 		}
-// 	}
-//
-// 	ret = uname(&utsname);
-// 	if (ret < 0) {
-// 		log_err("failed to get utsname");
-// 		return ret;
-// 	}
-//
-// 	if (strstr(utsname.release, "azure")) {
-// 		log_info("Detected Azure VM, using Azure ARP mode");
-// 		cfg.azure_arp_mode = true;
-// 		is_azure = true;
-// 	}
-//
-// 	pthread_barrier_init(&init_barrier, NULL, 2);
-//
-// 	ret = run_init_handlers("iokernel", iok_init_handlers,
-// 			ARRAY_SIZE(iok_init_handlers));
-// 	if (ret)
-// 		return ret;
-//
-// 	iok_info->cycles_per_us = cycles_per_us;
-// 	iok_info->managed_numa_node = managed_numa_node;
-// 	iok_info->external_directpath_enabled = cfg.vfio_directpath;
-// 	iok_info->external_directpath_rmp = vfio_prealloc_rmp;
-// 	iok_info->transparent_hugepages = cfg_transparent_hugepages_enabled;
-//
-// 	pthread_barrier_wait(&init_barrier);
-//
-// 	ksched_uintr_init();
-//
-// 	if (cfg.vfio_directpath)
-// 		dataplane_loop_vfio();
-// 	else
-// 		dataplane_loop();
-// 	return 0;
-// }
 
-/* Telemetry implementation. */
 int main(int argc, char *argv[])
 {
 	int i, ret;
+	bool controller_flags_supplied = false;
 	struct utsname utsname;
 
 	if (getuid() != 0) {
@@ -399,6 +232,27 @@ int main(int argc, char *argv[])
 	for (i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "noht")) {
 			cfg.noht = true;
+		} else if (!strcmp(argv[i], "bw_intervention") ||
+		           !strcmp(argv[i], "ht_intervention") ||
+		           !strcmp(argv[i], "timesharing") ||
+		           !strcmp(argv[i], "core_allocation")) {
+			const char *option = argv[i];
+			controller_flags_supplied = true;
+			bool enabled;
+			if (i + 1 >= argc ||
+			    (strcmp(argv[i + 1], "on") && strcmp(argv[i + 1], "off"))) {
+				fprintf(stderr, "%s requires on or off\n", option);
+				return -EINVAL;
+			}
+			enabled = !strcmp(argv[++i], "on");
+			if (!strcmp(option, "bw_intervention"))
+				cfg.bw_intervention = enabled;
+			else if (!strcmp(option, "ht_intervention"))
+				cfg.ht_intervention = enabled;
+			else if (!strcmp(option, "timesharing"))
+				cfg.timesharing = enabled;
+			else
+				cfg.core_allocation = enabled;
 		} else if (!strcmp(argv[i], "telemetry")) {
             char *end;
             unsigned long core, seconds;
@@ -491,6 +345,15 @@ int main(int argc, char *argv[])
 	if (ret < 0) {
 		log_err("failed to get utsname");
 		return ret;
+	}
+
+	if (cfg.bw_intervention && cfg.nobw) {
+		fprintf(stderr, "bw_intervention on requires bandwidth monitoring; remove nobw\n");
+		return -EINVAL;
+	}
+	if (sched_ops != &ias_ops && controller_flags_supplied) {
+		fprintf(stderr, "controller flags require the ias scheduler policy\n");
+		return -EINVAL;
 	}
 
 	/* Report each invalid telemetry configuration before exiting. */

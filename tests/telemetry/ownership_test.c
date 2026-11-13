@@ -45,6 +45,7 @@ static void finish_request(uint64_t value)
 
 int main(void)
 {
+    cfg.core_allocation = true;
     struct proc application_a = {.pid = 42};
     struct proc application_b = {.pid = 43};
     struct sched_spec specification = {.max_cores = 1};

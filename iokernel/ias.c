@@ -121,75 +121,7 @@ static void ias_cleanup_core(unsigned int core)
 	cores[core] = NULL;
 }
 
-/* Original upstream Caladan implementation, retained for comparison. */
-// static int ias_attach(struct proc *p, struct sched_spec *sched_cfg)
-// {
-// 	struct ias_data *sd;
-// 	int i, core, sib;
-//
-// 	/* validate parameters */
-// 	if (!cfg.noht && sched_cfg->guaranteed_cores % 2 != 0) {
-// 		log_err("ias: tried to attach proc with odd number of guaranteed cores");
-// 		return -EINVAL;
-// 	}
-//
-// 	/* allocate and initialize process state */
-// 	sd = malloc(sizeof(*sd));
-// 	if (!sd)
-// 		return -ENOMEM;
-// 	memset(sd, 0, sizeof(*sd));
-// 	sd->p = p;
-// 	sd->threads_guaranteed = sched_cfg->guaranteed_cores;
-// 	sd->threads_max = sched_cfg->max_cores;
-// 	sd->threads_limit = sched_cfg->max_cores;
-// 	sd->is_lc = sched_cfg->priority == SCHED_PRIO_LC;
-// 	if (sd->is_lc)
-// 		sd->ht_punish_us = sched_cfg->ht_punish_us;
-// 	sd->qdelay_us = sched_cfg->qdelay_us;
-// 	sd->quantum_us = sched_cfg->quantum_us;
-// 	sd->threads_active = 0;
-// 	p->policy_data = (unsigned long)sd;
-// 	list_add(&all_procs, &sd->all_link);
-//
-// 	/* reserve priority cores */
-// 	i = sd->threads_guaranteed;
-// 	sd->has_core_resv = i > 0;
-// 	while (i > 0) {
-// 		core = bitmap_find_next_cleared(ias_reserved_cores, NCPU, 0);
-// 		if (core == NCPU)
-// 			goto fail_reserve;
-//
-// 		bitmap_set(sd->reserved_cores, core);
-// 		bitmap_set(ias_reserved_cores, core);
-// 		i--;
-// #ifdef IAS_DEBUG
-// 		owners[core] = p->pid;
-// #endif
-//
-// 		if (cfg.noht)
-// 			continue;
-//
-// 		sib = sched_siblings[core];
-// 		bitmap_set(sd->reserved_cores, sib);
-// 		bitmap_set(ias_reserved_cores, sib);
-// 		i--;
-// #ifdef IAS_DEBUG
-// 		owners[sib] = p->pid;
-// #endif
-// 	}
-//
-// 	return 0;
-//
-// fail_reserve:
-// 	log_err("ias: not enough cores available for reservation");
-// 	list_del_from(&all_procs, &sd->all_link);
-// 	bitmap_xor(ias_reserved_cores, ias_reserved_cores,
-// 		   sd->reserved_cores, NCPU);
-// 	free(sd);
-// 	return -ENOENT;
-// }
 
-/* Implementation with application ownership bookkeeping. */
 static int ias_attach(struct proc *p, struct sched_spec *sched_cfg)
 {
 	struct ias_data *sd;
@@ -198,6 +130,11 @@ static int ias_attach(struct proc *p, struct sched_spec *sched_cfg)
 	/* validate parameters */
 	if (!cfg.noht && sched_cfg->guaranteed_cores % 2 != 0) {
 		log_err("ias: tried to attach proc with odd number of guaranteed cores");
+		return -EINVAL;
+	}
+
+	if (!cfg.core_allocation && sched_cfg->guaranteed_cores == 0) {
+		log_err("ias: core_allocation off requires nonzero guaranteed_cores");
 		return -EINVAL;
 	}
 
@@ -217,6 +154,8 @@ static int ias_attach(struct proc *p, struct sched_spec *sched_cfg)
 	sd->threads_guaranteed = sched_cfg->guaranteed_cores;
 	sd->threads_max = sched_cfg->max_cores;
 	sd->threads_limit = sched_cfg->max_cores;
+	if (!cfg.core_allocation)
+		sd->threads_limit = sd->threads_guaranteed;
 	sd->is_lc = sched_cfg->priority == SCHED_PRIO_LC;
 	if (sd->is_lc)
 		sd->ht_punish_us = sched_cfg->ht_punish_us;
@@ -264,27 +203,7 @@ fail_reserve:
 	return -ENOENT;
 }
 
-/* Original upstream Caladan implementation, retained for comparison. */
-// static void ias_detach(struct proc *p)
-// {
-// 	struct ias_data *sd = (struct ias_data *)p->policy_data;
-// 	int i;
-//
-// 	list_del_from(&all_procs, &sd->all_link);
-// 	bitmap_xor(ias_reserved_cores, ias_reserved_cores,
-// 		   sd->reserved_cores, NCPU);
-//
-// 	for (i = 0; i < NCPU; i++) {
-// 		if (cores[i] == sd)
-// 			cores[i] = NULL;
-// 	}
-//
-// 	ias_unmark_congested(sd);
-//
-// 	free(sd);
-// }
 
-/* Implementation with application ownership bookkeeping. */
 static void ias_detach(struct proc *p)
 {
 	struct ias_data *sd = (struct ias_data *)p->policy_data;
@@ -306,36 +225,7 @@ static void ias_detach(struct proc *p)
 	free(sd);
 }
 
-/* Original upstream Caladan implementation, retained for comparison. */
-// static int ias_run_kthread_on_core(struct ias_data *sd, unsigned int core)
-// {
-// 	int ret;
-//
-// 	/*
-// 	 * WARNING: A kthread could be stuck waiting to detach and thus
-// 	 * temporarily unavailable even if it is no longer assigned to a core.
-// 	 * We check with the scheduler layer here to catch such a race
-// 	 * condition.  In this sense, applications can get new cores more
-// 	 * quickly if they yield promptly when requested.
-// 	 */
-// 	if (sched_threads_avail(sd->p) == 0)
-// 		return -EBUSY;
-//
-// 	ret = sched_run_on_core(sd->p, core);
-// 	if (ret)
-// 		return ret;
-//
-// 	ias_cleanup_core(core);
-// 	cores[core] = sd;
-// 	ias_gen[core]++;
-// 	bitmap_clear(ias_idle_cores, core);
-// 	sd->threads_active++;
-// 	sd->waking = true;
-// 	ias_update_congestion(sd);
-// 	return 0;
-// }
 
-/* Implementation with scheduler-event telemetry. */
 static int ias_run_kthread_on_core(struct ias_data *sd, unsigned int core)
 {
 	int ret;
@@ -373,27 +263,7 @@ static int ias_run_kthread_on_core(struct ias_data *sd, unsigned int core)
  *
  * Returns 0 if successful.
  */
-/* Original upstream Caladan implementation, retained for comparison. */
-// int ias_idle_placeholder_on_core(struct ias_data *sd, unsigned int core)
-// {
-// 	int ret;
-//
-// 	if (!bitmap_test(ias_idle_cores, core)) {
-// 		ret = sched_idle_on_core(0, core);
-// 		if (ret)
-// 			return -EBUSY;
-// 	}
-//
-// 	ias_cleanup_core(core);
-// 	cores[core] = sd;
-// 	ias_gen[core]++;
-// 	bitmap_set(ias_idle_cores, core);
-// 	sd->threads_active++;
-// 	ias_update_congestion(sd);
-// 	return 0;
-// }
 
-/* Implementation with scheduler-event telemetry. */
 int ias_idle_placeholder_on_core(struct ias_data *sd, unsigned int core)
 {
 	int ret;
@@ -421,25 +291,7 @@ int ias_idle_placeholder_on_core(struct ias_data *sd, unsigned int core)
  *
  * Returns 0 if successful.
  */
-/* Original upstream Caladan implementation, retained for comparison. */
-// int ias_idle_on_core(unsigned int core)
-// {
-// 	int ret;
-//
-// 	if (!bitmap_test(ias_idle_cores, core)) {
-// 		ret = sched_idle_on_core(0, core);
-// 		if (ret)
-// 			return -EBUSY;
-// 	}
-//
-// 	ias_cleanup_core(core);
-// 	cores[core] = NULL;
-// 	ias_gen[core]++;
-// 	bitmap_set(ias_idle_cores, core);
-// 	return 0;
-// }
 
-/* Implementation with scheduler-event telemetry. */
 int ias_idle_on_core(unsigned int core)
 {
 	int ret;
@@ -463,6 +315,10 @@ static bool ias_can_preempt_core(struct ias_data *sd, unsigned int core)
 {
 	struct ias_data *cur = cores[core];
 	struct thread *th;
+
+	/* Fixed allocations never borrow another application's reserved CPUs. */
+	if (!cfg.core_allocation)
+		return bitmap_test(sd->reserved_cores, core) && cur == NULL;
 
 	/* any task can take idle cores */
 	if (cur == NULL)
@@ -632,6 +488,18 @@ static int ias_notify_core_needed(struct proc *p)
 	int ret;
 	struct ias_data *sd = (struct ias_data *)p->policy_data;
 
+	/* Start the fixed reservation when the application first needs CPU time. */
+	if (!cfg.core_allocation) {
+		while (sd->threads_active < sd->threads_guaranteed) {
+			ret = ias_add_kthread(sd);
+			if (ret) {
+				ias_mark_congested(sd);
+				break;
+			}
+		}
+		return 0;
+	}
+
 	if (ias_should_add_kthread_now(sd)) {
 		ret = ias_add_kthread(sd);
 		if (!ret)
@@ -713,6 +581,15 @@ static struct ias_data *ias_choose_kthread(unsigned int core)
 
 	if (!congested_procs_nr)
 		return NULL;
+
+	if (!cfg.core_allocation) {
+		ias_for_each_proc(sd) {
+			if (sd->is_congested && sd->threads_active < sd->threads_limit &&
+			    bitmap_test(sd->reserved_cores, core))
+				return sd;
+		}
+		return NULL;
+	}
 
 	/* feed starving LCs in a FIFO order */
 	list_for_each(&congested_procs[0], sd, congested_link) {
@@ -849,12 +726,13 @@ static void ias_sched_poll(uint64_t now, int idle_cnt, bitmap_ptr_t idle)
 		last_us = now;
 		if (!cfg.nobw)
 			ias_bw_poll();
-		if (!cfg.noht)
+		if (!cfg.noht && cfg.ht_intervention)
 			ias_ht_poll();
-		ias_ts_poll();
+		if (cfg.timesharing)
+			ias_ts_poll();
 	}
 
-	if (now - last_core_ts_us >= IAS_QUANTA_US) {
+	if (cfg.core_allocation && now - last_core_ts_us >= IAS_QUANTA_US) {
 		last_core_ts_us = now;
 		ias_core_ts_poll();
 	}

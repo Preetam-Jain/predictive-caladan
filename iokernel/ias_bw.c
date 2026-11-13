@@ -24,12 +24,6 @@ float	 ias_bw_estimate_multiplier;
 /* bandwidth threshold in cache lines per cycle for a single channel */
 static float ias_bw_thresh;
 
-/* Original upstream sample layout, retained for comparison. */
-// struct pmc_sample {
-// 	uint64_t gen;
-// 	uint64_t val;
-// 	uint64_t tsc;
-// };
 
 struct pmc_sample {
 	uint64_t gen; /* Existing IAS scheduling generation at request time. */
@@ -50,85 +44,86 @@ static void ias_bw_throttle_core(int core)
                 ias_idle_on_core(core);
 }
 
-/* Original implementation, retained for comparison. */
-// static void ias_bw_request_pmc(uint64_t sel, struct pmc_sample *samples)
-// {
-// 	struct ias_data *sd;
-// 	int core, tmp;
-//
-// 	sched_for_each_allowed_core(core, tmp) {
-// 		sd = cores[core];
-// 		if (!sd || sd->is_lc ||
-// 		    bitmap_test(ias_ht_punished_cores, core)) {
-// 			samples[core].gen = ias_gen[core] - 1;
-// 			continue;
-// 		}
-//
-// 		samples[core].gen = ias_gen[core];
-// 		ksched_enqueue_pmc(core, sel);
-// 	}
-// }
-
-/* Samples both LC and BE applications for telemetry. */
+/* Original controller helper; measurement-only collection when disabled. */
 static void ias_bw_request_pmc(uint64_t sel, struct pmc_sample *samples)
 {
+	struct ias_data *sd;
 	int core, tmp;
 
-	sched_for_each_allowed_core(core, tmp) {
-		struct pmc_sample *sample = &samples[core];
-		/* Never overwrite a request still being handled by the target CPU. */
-		if (sample->request_pending || !cores[core] ||
-		    bitmap_test(ias_ht_punished_cores, core))
-			continue;
+	if (!cfg.bw_intervention) {
+		sched_for_each_allowed_core(core, tmp) {
+			struct pmc_sample *sample = &samples[core];
+			/* Never overwrite a request still being handled by the target CPU. */
+			if (sample->request_pending || !cores[core] ||
+			    bitmap_test(ias_ht_punished_cores, core))
+				continue;
 
-		/* Preserve normal eligibility; ownership can span intervening idle time. */
-		sample->gen = ias_gen[core];
-		sample->app_id_at_request = last_app_id[core];
-		sample->app_owner_gen_at_request = app_owner_gen[core];
-		sample->pid_at_request = last_app_pid[core];
-		sample->request_pending = true;
+			/* Preserve normal eligibility; ownership can span intervening idle time. */
+			sample->gen = ias_gen[core];
+			sample->app_id_at_request = last_app_id[core];
+			sample->app_owner_gen_at_request = app_owner_gen[core];
+			sample->pid_at_request = last_app_pid[core];
+			sample->request_pending = true;
+			ksched_enqueue_pmc(core, sel);
+		}
+		return;
+	}
+
+	sched_for_each_allowed_core(core, tmp) {
+		sd = cores[core];
+		if (!sd || sd->is_lc ||
+		    bitmap_test(ias_ht_punished_cores, core)) {
+			samples[core].gen = ias_gen[core] - 1;
+			continue;
+		}
+
+		samples[core].gen = ias_gen[core];
+		samples[core].app_id_at_request = last_app_id[core];
+		samples[core].app_owner_gen_at_request = app_owner_gen[core];
+		samples[core].pid_at_request = last_app_pid[core];
 		ksched_enqueue_pmc(core, sel);
 	}
 }
 
-/* Original Caladan implementation (HEAD), retained for comparison. */
-// static void ias_bw_gather_pmc(struct pmc_sample *samples)
-// {
-// 	int core, tmp;
-// 	struct pmc_sample *s;
-//
-// 	sched_for_each_allowed_core(core, tmp) {
-// 		s = &samples[core];
-// 		if (s->gen != ias_gen[core])
-// 			continue;
-// 		if (!ksched_poll_pmc(core, &s->val, &s->tsc)) {
-// 			s->gen = ias_gen[core] - 1;
-// 			ias_bw_sample_failures++;
-// 			continue;
-// 		}
-// 	}
-// }
-
-/* Telemetry implementation. */
+/* Original controller helper; measurement-only collection when disabled. */
 static void ias_bw_gather_pmc(struct pmc_sample *samples)
 {
 	int core, tmp;
+	struct pmc_sample *s;
+
+	if (!cfg.bw_intervention) {
+		sched_for_each_allowed_core(core, tmp) {
+			struct pmc_sample *sample = &samples[core];
+			if (!sample->request_pending)
+				continue;
+			if (!ksched_poll_pmc(core, &sample->val, &sample->tsc)) {
+				ias_bw_sample_failures++;
+				telemetry_pmc_failure(core, sample->gen, rdtsc());
+				continue;
+			}
+			sample->request_pending = false;
+			/* Preserve the physical-core reading even when ownership changed. */
+			telemetry_llc(core, sample->pid_at_request, sample->gen,
+				     sample->tsc, sample->val, sample->app_id_at_request,
+				     sample->app_owner_gen_at_request, app_owner_gen[core],
+				     ias_gen[core]);
+		}
+		return;
+	}
 
 	sched_for_each_allowed_core(core, tmp) {
-		struct pmc_sample *sample = &samples[core];
-		if (!sample->request_pending)
+		s = &samples[core];
+		if (s->gen != ias_gen[core])
 			continue;
-		if (!ksched_poll_pmc(core, &sample->val, &sample->tsc)) {
+		if (!ksched_poll_pmc(core, &s->val, &s->tsc)) {
+			telemetry_pmc_failure(core, s->gen, rdtsc());
+			s->gen = ias_gen[core] - 1;
 			ias_bw_sample_failures++;
-			telemetry_pmc_failure(core, sample->gen, rdtsc());
 			continue;
 		}
-		sample->request_pending = false;
-		/* Preserve the physical-core reading even when ownership changed. */
-		telemetry_llc(core, sample->pid_at_request, sample->gen,
-			     sample->tsc, sample->val, sample->app_id_at_request,
-			     sample->app_owner_gen_at_request, app_owner_gen[core],
-			     ias_gen[core]);
+		telemetry_llc(core, s->pid_at_request, s->gen, s->tsc, s->val,
+		              s->app_id_at_request, s->app_owner_gen_at_request,
+		              app_owner_gen[core], ias_gen[core]);
 	}
 }
 
@@ -232,28 +227,7 @@ static void ias_bw_relax(void)
 	}
 }
 
-/* Original Caladan implementation (HEAD), retained for comparison. */
-// static float ias_measure_bw(void)
-// {
-// 	static uint64_t last_tsc = 0;
-// 	static uint32_t last_cas = 0;
-// 	uint64_t tsc;
-// 	uint32_t cur_cas;
-// 	float bw_estimate;
-//
-// 	/* update the bandwidth estimate */
-// 	barrier();
-// 	tsc = rdtsc();
-// 	barrier();
-// 	cur_cas = pcm_caladan_get_cas_count(0);
-// 	bw_estimate = (float)(cur_cas - last_cas) / (float)(tsc - last_tsc);
-// 	last_cas = cur_cas;
-// 	last_tsc = tsc;
-// 	ias_bw_estimate = bw_estimate;
-// 	return bw_estimate;
-// }
 
-/* Telemetry implementation. */
 static float ias_measure_bw(void)
 {
 	static uint64_t last_tsc = 0;
@@ -275,127 +249,67 @@ static float ias_measure_bw(void)
 	return bw_estimate;
 }
 
-/* Original controller states, retained for comparison. */
-// enum {
-// 	IAS_BW_STATE_RELAX = 0,
-// 	IAS_BW_STATE_SAMPLE,
-// 	IAS_BW_STATE_PUNISH,
-// };
-
-/* Original upstream paired buffers, retained for comparison. */
-// static struct pmc_sample arr_1[NCPU], arr_2[NCPU];
+enum {
+	IAS_BW_STATE_RELAX = 0,
+	IAS_BW_STATE_SAMPLE,
+	IAS_BW_STATE_PUNISH,
+};
+static struct pmc_sample arr_1[NCPU], arr_2[NCPU];
 static struct pmc_sample pending_samples[NCPU];
 
 /**
  * ias_bw_poll - runs the bandwidth controller
  */
-/* Original implementation, retained for comparison. */
-// void ias_bw_poll(void)
-// {
-// 	static struct pmc_sample *start = arr_1, *end = arr_2;
-// 	static int state;
-// 	bool throttle;
-//
-// 	assert(!cfg.nobw);
-//
-// 	/* detect if we're over the bandwidth threshold */
-// 	throttle = ias_measure_bw() >= ias_bw_thresh;
-//
-// 	/* run the state machine */
-// 	switch (state) {
-// 	case IAS_BW_STATE_RELAX:
-// 		if (throttle) {
-// 			ias_bw_request_pmc(PMC_LLC_MISSES, start);
-// 			state = IAS_BW_STATE_SAMPLE;
-// 			break;
-// 		}
-// 		ias_bw_relax();
-// 		break;
-//
-// 	case IAS_BW_STATE_SAMPLE:
-// 		state = IAS_BW_STATE_PUNISH;
-// 		ias_bw_gather_pmc(start);
-// 		ias_bw_request_pmc(PMC_LLC_MISSES, end);
-// 		break;
-//
-// 	case IAS_BW_STATE_PUNISH:
-// 		ias_bw_gather_pmc(end);
-// 		if (!throttle) {
-// 			ias_bw_sample_aborts++;
-// 			state = IAS_BW_STATE_RELAX;
-// 			break;
-// 		}
-// 		ias_bw_punish(start, end);
-// 		swapvars(start, end);
-// 		ias_bw_request_pmc(PMC_LLC_MISSES, end);
-// 		break;
-//
-// 	default:
-// 		panic("ias: invalid bw state");
-// 	}
-// }
-
-/* Measurement-only bandwidth polling; no bandwidth policy actions. */
-/* Previous console logging helper, retained for comparison. Raw snapshot submission now lives in ias_bw_gather_pmc(). */
-// static void ias_bw_print_samples(struct pmc_sample *start,
-//                                  struct pmc_sample *end)
-// {
-// 	int core, tmp;
-//
-// 	sched_for_each_allowed_core(core, tmp) {
-// 		if (!cores[core] || start[core].gen != end[core].gen ||
-// 		    start[core].gen != ias_gen[core] ||
-// 		    end[core].tsc <= start[core].tsc)
-// 			continue;
-//
-// 		log_info("llc: core=%d pid=%d misses=%lu interval_us=%.2f",
-// 			 core, cores[core]->p->pid,
-// 			 (unsigned long)(end[core].val - start[core].val),
-// 			 (double)(end[core].tsc - start[core].tsc) / cycles_per_us);
-// 	}
-// }
-
-/* Previous measurement-only implementation with console logging, retained for comparison. */
-// void ias_bw_poll(void)
-// {
-// 	static struct pmc_sample *start = arr_1, *end = arr_2;
-// 	static bool sampling_started, first_start_collected;
-// 	float bw_estimate;
-//
-// 	assert(!cfg.nobw);
-// 	bw_estimate = ias_measure_bw();
-// 	if (sampling_started)
-// 		log_info("bandwidth: estimated_MBps=%.2f",
-// 			 (double)bw_estimate * ias_bw_estimate_multiplier);
-//
-// 	/* Establish the first interval's start before requesting its end. */
-// 	if (!sampling_started) {
-// 		ias_bw_request_pmc(PMC_LLC_MISSES, start);
-// 		sampling_started = true;
-// 		return;
-// 	}
-//
-// 	if (!first_start_collected) {
-// 		ias_bw_gather_pmc(start);
-// 		first_start_collected = true;
-// 	} else {
-// 		ias_bw_gather_pmc(end);
-// 		ias_bw_print_samples(start, end);
-// 		swapvars(start, end);
-// 	}
-//
-// 	/* ksched completes these requests after the scheduler sends interrupts. */
-// 	ias_bw_request_pmc(PMC_LLC_MISSES, end);
-// }
-
-/* Measurement-only implementation with buffered disk telemetry. */
 void ias_bw_poll(void)
 {
+	static struct pmc_sample *start = arr_1, *end = arr_2;
+	static int state;
+	bool throttle;
+
 	assert(!cfg.nobw);
-	ias_measure_bw();
-	ias_bw_gather_pmc(pending_samples);
-	/* ksched handles new requests after the scheduler sends interrupts. */
-	ias_bw_request_pmc(PMC_LLC_MISSES, pending_samples);
+
+	if (!cfg.bw_intervention) {
+		ias_measure_bw();
+		ias_bw_gather_pmc(pending_samples);
+		ias_bw_request_pmc(PMC_LLC_MISSES, pending_samples);
+		return;
+	}
+
+	/* detect if we're over the bandwidth threshold */
+	throttle = ias_measure_bw() >= ias_bw_thresh;
+
+	/* run the state machine */
+	switch (state) {
+	case IAS_BW_STATE_RELAX:
+		if (throttle) {
+			ias_bw_request_pmc(PMC_LLC_MISSES, start);
+			state = IAS_BW_STATE_SAMPLE;
+			break;
+		}
+		ias_bw_relax();
+		break;
+
+	case IAS_BW_STATE_SAMPLE:
+		state = IAS_BW_STATE_PUNISH;
+		ias_bw_gather_pmc(start);
+		ias_bw_request_pmc(PMC_LLC_MISSES, end);
+		break;
+
+	case IAS_BW_STATE_PUNISH:
+		ias_bw_gather_pmc(end);
+		if (!throttle) {
+			ias_bw_sample_aborts++;
+			state = IAS_BW_STATE_RELAX;
+			break;
+		}
+		ias_bw_punish(start, end);
+		swapvars(start, end);
+		ias_bw_request_pmc(PMC_LLC_MISSES, end);
+		break;
+
+	default:
+		panic("ias: invalid bw state");
+	}
 }
 
 int ias_bw_init(void)
