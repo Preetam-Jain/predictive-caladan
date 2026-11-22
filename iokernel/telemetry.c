@@ -208,10 +208,10 @@ static struct stream *const streams[] = {
 
 int telemetry_core = -1;
 const char *telemetry_path;
-unsigned int telemetry_seconds = 120;
+unsigned int telemetry_collection_duration_seconds = 120;
 static atomic_bool finished;
 static atomic_int writer_error;
-static uint64_t deadline;
+static uint64_t telemetry_stop_tsc;
 static bool active;
 static uint8_t experiment_id[16];
 
@@ -292,12 +292,18 @@ static int stream_open(struct stream *stream)
 
     error = posix_memalign((void **)&stream->records, 64,
                           stream->capacity * stream->record_bytes);
-    if (error)
+    if (error) {
+        log_err("telemetry%s: cannot allocate record buffer (%zu bytes): %s",
+                stream->suffix, stream->capacity * stream->record_bytes, strerror(error));
         return error;
+    }
     /* First-touch after dataplane initialization follows the socket's policy. */
     memset(stream->records, 0, stream->capacity * stream->record_bytes);
-    if (asprintf(&path, "%s%s", telemetry_path, stream->suffix) < 0)
+    if (asprintf(&path, "%s%s", telemetry_path, stream->suffix) < 0) {
+        log_err("telemetry%s: cannot allocate output path: %s",
+                stream->suffix, strerror(ENOMEM));
         return ENOMEM;
+    }
     stream->fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (stream->fd < 0) {
         error = errno;
@@ -308,8 +314,11 @@ static int stream_open(struct stream *stream)
     free(path);
     size_t header_bytes = sizeof(struct file_header) + sched_cores_nr * sizeof(uint32_t);
     stream->header = calloc(1, header_bytes);
-    if (!stream->header)
+    if (!stream->header) {
+        log_err("telemetry%s: cannot allocate file header (%zu bytes): %s",
+                stream->suffix, header_bytes, strerror(ENOMEM));
         return ENOMEM;
+    }
     *stream->header = (struct file_header){
         .magic = "CALATLM",
         .version = FILE_FORMAT_VERSION,
@@ -327,7 +336,11 @@ static int stream_open(struct stream *stream)
     memcpy(stream->header->experiment_id, experiment_id, sizeof(experiment_id));
     for (int i = 0; i < sched_cores_nr; i++)
         stream->header->cores[i] = sched_cores_tbl[i];
-    return write_all(stream->fd, stream->header, stream->header->header_bytes);
+    error = write_all(stream->fd, stream->header, stream->header->header_bytes);
+    if (error)
+        log_err("telemetry%s: cannot write initial header: %s",
+                stream->suffix, strerror(error));
+    return error;
 }
 
 /* Advance at most one batch per stream per pass, including across a ring wrap. */
@@ -335,17 +348,13 @@ static int drain_batch(struct stream *stream, bool done, bool *made_progress)
 {
     uint64_t consumed = atomic_load_explicit(&stream->tail, memory_order_relaxed);
     uint64_t available = atomic_load_explicit(&stream->head, memory_order_acquire) - consumed;
-    size_t records_to_write = available;
+    size_t records_to_write = MIN(available, stream->batch_size);
     int error;
 
     if (!available || (!done && available < stream->batch_size))
         return 0;
-    if (records_to_write > stream->batch_size)
-        records_to_write = stream->batch_size;
     size_t offset = consumed % stream->capacity;
-    size_t first_part = records_to_write;
-    if (first_part > stream->capacity - offset)
-        first_part = stream->capacity - offset;
+    size_t first_part = MIN(records_to_write, stream->capacity - offset);
     struct iovec parts[] = {
         {
             .iov_base = stream->records + offset * stream->record_bytes,
@@ -369,16 +378,30 @@ static int drain_batch(struct stream *stream, bool done, bool *made_progress)
 static int complete_stream(struct stream *stream)
 {
     int error;
-    if (fsync(stream->fd))
-        return errno;
+    if (fsync(stream->fd)) {
+        error = errno;
+        log_err("telemetry%s: cannot flush records: %s", stream->suffix, strerror(error));
+        return error;
+    }
     stream->header->produced = stream->produced;
     stream->header->dropped = stream->dropped;
     stream->header->flags = CAPTURE_COMPLETE;
-    if (lseek(stream->fd, 0, SEEK_SET) < 0)
-        return errno;
-    error = write_all(stream->fd, stream->header, stream->header->header_bytes);
-    if (!error && fsync(stream->fd))
+    if (lseek(stream->fd, 0, SEEK_SET) < 0) {
         error = errno;
+        log_err("telemetry%s: cannot seek to header: %s", stream->suffix, strerror(error));
+        return error;
+    }
+    error = write_all(stream->fd, stream->header, stream->header->header_bytes);
+    if (error) {
+        log_err("telemetry%s: cannot write completed header: %s",
+                stream->suffix, strerror(error));
+        return error;
+    }
+    if (fsync(stream->fd)) {
+        error = errno;
+        log_err("telemetry%s: cannot flush completed header: %s",
+                stream->suffix, strerror(error));
+    }
     return error;
 }
 
@@ -413,8 +436,13 @@ close_streams:
     if (error)
         atomic_store_explicit(&writer_error, error, memory_order_release);
     for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
-        if (close(streams[i]->fd) && !error)
-            error = errno;
+        if (close(streams[i]->fd)) {
+            int close_error = errno;
+            log_err("telemetry%s: cannot close output file: %s",
+                    streams[i]->suffix, strerror(close_error));
+            if (!error)
+                error = close_error;
+        }
         streams[i]->fd = -1;
         free(streams[i]->header);
         streams[i]->header = NULL;
@@ -455,13 +483,21 @@ int telemetry_init(void)
             goto fail;
     }
     error = pthread_attr_init(&attributes);
-    if (error)
+    if (error) {
+        log_err("telemetry: cannot initialize writer attributes: %s", strerror(error));
         goto fail;
+    }
     CPU_ZERO(&cpu_set);
     CPU_SET(telemetry_core, &cpu_set);
     error = pthread_attr_setaffinity_np(&attributes, sizeof(cpu_set), &cpu_set);
-    if (!error)
+    if (error) {
+        log_err("telemetry: cannot set writer affinity to core %d: %s",
+                telemetry_core, strerror(error));
+    } else {
         error = pthread_create(&thread, &attributes, writer, NULL);
+        if (error)
+            log_err("telemetry: cannot create writer thread: %s", strerror(error));
+    }
     pthread_attr_destroy(&attributes);
     if (error)
         goto fail;
@@ -483,10 +519,10 @@ fail:
     return -error;
 }
 
-void telemetry_tick(void)
+void telemetry_check_stop(void)
 {
     if (active && (atomic_load_explicit(&writer_error, memory_order_acquire) ||
-                   (deadline && rdtsc() >= deadline))) {
+                   (telemetry_stop_tsc && rdtsc() >= telemetry_stop_tsc))) {
         active = false;
         atomic_store_explicit(&finished, true, memory_order_release);
     }
@@ -497,8 +533,8 @@ static void submit(struct stream *stream, const void *record)
     uint64_t next;
     if (!active)
         return;
-    if (!deadline)
-        deadline = rdtsc() + (uint64_t)telemetry_seconds * MICROSECONDS_PER_SECOND * cycles_per_us;
+    if (!telemetry_stop_tsc)
+        telemetry_stop_tsc = rdtsc() + (uint64_t)telemetry_collection_duration_seconds * MICROSECONDS_PER_SECOND * cycles_per_us;
     next = atomic_load_explicit(&stream->head, memory_order_relaxed);
     if (next - atomic_load_explicit(&stream->tail, memory_order_acquire) == stream->capacity) {
         stream->dropped++;

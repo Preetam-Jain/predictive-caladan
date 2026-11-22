@@ -154,8 +154,8 @@ int main(int argc, char **argv)
             emit_sample(stream, stream->capacity + index);
         }
     }
-    deadline = 1;
-    telemetry_tick();
+    telemetry_stop_tsc = 1;
+    telemetry_check_stop();
     assert(!active);
     assert(!pthread_join(thread, NULL));
     assert(!atomic_load(&writer_error));
@@ -180,7 +180,7 @@ int main(int argc, char **argv)
     active = true;
     writer(NULL);
     assert(atomic_load(&writer_error) == ENOSPC);
-    telemetry_tick();
+    telemetry_check_stop();
     assert(!active);
     for (size_t i = 0; i < ARRAY_SIZE(streams); i++)
         free(streams[i]->records);

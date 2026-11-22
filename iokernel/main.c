@@ -265,7 +265,7 @@ int main(int argc, char *argv[])
             errno = 0;
             seconds = strtoul(argv[++i], &end, 10);
             if (errno || end == argv[i] || *end || !seconds || seconds > 86400) return -EINVAL;
-            telemetry_seconds = seconds;
+            telemetry_collection_duration_seconds = seconds;
         } else if (!strcmp(argv[i], "nobw")) {
 			cfg.nobw = true;
 		} else if (!strcmp(argv[i], "no_hw_qdel")) {

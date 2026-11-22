@@ -5,10 +5,10 @@
 extern int telemetry_core;
 /* Output prefix: each stream appends its own suffix. "-" reserves the core only. */
 extern const char *telemetry_path;
-extern unsigned int telemetry_seconds;
+extern unsigned int telemetry_collection_duration_seconds;
 
 int telemetry_init(void);
-void telemetry_tick(void);
+void telemetry_check_stop(void);
 void telemetry_bandwidth(uint64_t tsc, uint32_t cas);
 void telemetry_llc(uint32_t core, uint32_t pid_at_request, uint64_t sched_gen_at_request,
                    uint64_t tsc, uint64_t misses, uint64_t app_id_at_request,

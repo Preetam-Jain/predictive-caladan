@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Usage: deploy.sh [--repo DIRECTORY] [--identity KEY] USER@HOST [USER@HOST ...]
+Usage: deploy.sh [--repo DIRECTORY] [--identity KEY] [--port PORT] [--batch] USER@HOST [USER@HOST ...]
 
 Run locally from any directory. Deploys this checkout to a NEW directory under
 each remote user's home (default: predictive-caladan). Existing destinations
@@ -31,6 +31,17 @@ while (($#)); do
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             ssh_command+=(-i "$2")
             scp_command+=(-i "$2")
+            shift 2 ;;
+        --batch)
+            ssh_command+=(-o BatchMode=yes -o ConnectTimeout=10)
+            scp_command+=(-o BatchMode=yes -o ConnectTimeout=10)
+            shift ;;
+        --port)
+            [[ $# -ge 2 && $2 =~ ^[0-9]+$ ]] && ((10#$2 >= 1 && 10#$2 <= 65535)) || {
+                printf 'Invalid SSH port.\n' >&2; exit 2;
+            }
+            ssh_command+=(-p "$2")
+            scp_command+=(-P "$2")
             shift 2 ;;
         --) shift; break ;;
         -*) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;

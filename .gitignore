@@ -11,3 +11,8 @@ iokerneld
 .rustup-local
 scripts/__pycache__/
 experiments/
+results/
+scripts/experiments/__pycache__/
+tests/experiments/__pycache__/
+!scripts/experiments/
+!tests/experiments/

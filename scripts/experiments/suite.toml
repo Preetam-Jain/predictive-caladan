@@ -1,0 +1,158 @@
+# Run on your desktop with Python 3.11+:
+#   python3 scripts/experiments/run.py --config scripts/experiments/suite.toml --plan
+#   python3 scripts/experiments/run.py --config scripts/experiments/suite.toml --run
+# No node setup/build/install commands are run automatically.
+
+# --setup-only performs these steps without calibration or the experiment suite.
+# enabled=true also performs setup before --run. Existing deployments are never overwritten.
+[setup]
+enabled = false
+deploy_code = true # Fresh checkout under the remote user's HOME; false for an existing checkout.
+install_dependencies = true
+initialize_submodules = true
+build_runtime = true
+apply_mlx5_fix = true # Known DPDK-forwarding fix; no firmware changes.
+configure_machine = true
+build_loadgen = true
+build_memcached = true
+build_stream_dram = true
+build_swaptions_gc = true # Requires runtime GC support; setup fails explicitly if absent.
+verify_machine = true
+run_smoke_tests = true
+build_jobs = 8
+stage_timeout_seconds = 3600
+smoke_seconds = 5
+smoke_rps = 1000
+smoke_values = 1000
+artifact_repository = "https://github.com/shenango/caladan-all.git"
+artifact_revision = "37a3822be053c37275f0aefea60da26246fd01cb"
+
+[nodes.server]
+host = "CHANGE_ME"
+user = "CHANGE_ME"
+port = 22
+identity_file = "" # Empty uses your SSH agent/default keys. Never put a password here.
+repo = "/home/preetam/predictive-caladan"
+artifact = "/home/preetam/caladan-all"
+remote_results = "/tmp/caladan-experiments"
+sudo = true # Requires passwordless sudo -n for experiment commands.
+numa_node = 0
+nic_pci = "0000:03:00.1"
+allowed_cpus = "" # Optional IOKernel CPU list; set for your node's topology.
+
+[nodes.client]
+host = "CHANGE_ME"
+user = "CHANGE_ME"
+port = 22
+identity_file = ""
+repo = "/home/preetam/predictive-caladan"
+artifact = "/home/preetam/caladan-all"
+remote_results = "/tmp/caladan-experiments"
+sudo = true
+numa_node = 0
+nic_pci = "0000:03:00.1"
+allowed_cpus = ""
+
+[network]
+server_ip = "192.168.1.101" # Runtime addresses, NOT necessarily the SSH addresses.
+client_ip = "192.168.1.102"
+antagonist_ip = "192.168.1.103"
+netmask = "255.255.255.0"
+gateway = "192.168.1.1"
+port = 11211
+directpath = false
+
+[allocation]
+memcached_cores = 4
+memcached_guaranteed = 4
+antagonist_cores = 4
+antagonist_guaranteed = 4 # Must be nonzero when core_allocation is false.
+client_cores = 4
+writer_cpu = 4 # Always reserved, including logging-off/calibration runs.
+
+[interventions]
+bandwidth = false
+hyperthread = false
+timesharing = false
+core_allocation = false
+
+[conditions]
+memcached_alone = true
+memcached_stream_dram = false
+memcached_swaptions_gc = false
+
+[logging]
+run_without_logging = true
+run_with_logging = true
+# Telemetry begins at IOKernel startup, before preload. It has no early-stop API.
+# Logging-on runs wait for this deadline and disk finalization before collection.
+# The launcher rejects a run if measurement finishes after capture has ended.
+capture_seconds = 300
+finalize_timeout_seconds = 120
+reject_dropped_records = true
+
+[suite]
+repetitions = 3
+warmup_seconds = 30
+measurement_seconds = 120
+load_fractions = [0.5, 0.7, 0.9]
+randomize_order = true
+random_seed = 42
+continue_after_failure = false
+startup_timeout_seconds = 120
+client_timeout_seconds = 600 # Includes preload, warmup, measurement, and response drain.
+minimum_free_gb = 20
+
+[calibration]
+enabled = true
+# Used only when enabled=false; otherwise capacity is measured and saved automatically.
+capacity_rps = 1000000
+start_rps = 100000
+maximum_rps = 12000000
+rate_multiplier = 2.0
+refinement_steps = 4
+confirmations = 2
+warmup_seconds = 5
+measurement_seconds = 20
+maximum_p99_9_us = 100.0
+minimum_response_fraction = 0.99
+minimum_send_fraction = 0.99
+minimum_schedule_adherence_percent = 99.0
+
+[validation]
+# Overloaded colocated runs are useful data, not automatic failures. Validate
+# client send ability separately from application response throughput/latency.
+minimum_send_fraction = 0.95
+minimum_schedule_adherence_percent = 99.0
+maximum_logging_latency_increase_percent = 5.0
+maximum_logging_throughput_loss_percent = 3.0
+
+[memcached]
+binary = "memcached/memcached" # Relative to server.artifact, or an absolute path.
+memory_mb = 32000
+hashpower = 25
+nvalues = 32000000
+key_size = 20
+value_size = 2
+pctset = 30 # Per thousand: 30 means 3% SET, 97% GET; keys are uniform in this client.
+client_connections = 64
+trace_requests = false # true emits completed-request traces; false emits normal summaries.
+
+[stream_dram]
+binary = "apps/netbench/stress_shm" # Relative to server.repo, or absolute.
+# Calibrate this working set for your hardware; NOT automatically a DRAM antagonist.
+region_bytes_per_worker = 4090880
+iterations_per_operation = 1
+use_barrier = true
+
+[swaptions_gc]
+binary = "parsec/pkgs/apps/swaptions/inst/amd64-linux.gcc-shenango-gc/bin/swaptions"
+user_threads = 4
+swaptions = 5000000
+simulations = 400
+
+[batch_monitor]
+enabled = true
+binary = "apps/netbench/stress_shm_query"
+interval_us = 100000
+cpu = -1 # Set a dedicated OS/control CPU; -1 leaves placement to Linux.

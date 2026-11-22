@@ -902,7 +902,7 @@ void sched_poll(void)
 	 * final pass --- let the scheduler policy decide how to respond
 	 */
 
-	telemetry_tick();
+	telemetry_check_stop();
 	sched_ops->sched_poll(now, idle_cnt, idle);
 	ksched_send_intrs();
 }
