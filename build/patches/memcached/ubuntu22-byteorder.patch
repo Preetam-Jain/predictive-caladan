@@ -1,0 +1,16 @@
+diff --git a/memcached.c b/memcached.c
+--- a/memcached.c
++++ b/memcached.c
+@@ -61,6 +61,12 @@
+ #endif
+ #endif
+ 
++/* Replace libc's macros with the runtime byte-order helpers below. */
++#undef htonl
++#undef htons
++#undef ntohl
++#undef ntohs
++
+ #define htonll(x) hton64(x)
+ #define htonl(x) hton32(x)
+ #define htons(x) hton16(x)

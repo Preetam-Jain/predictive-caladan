@@ -54,7 +54,7 @@ if $install_packages; then
         nettle-dev libacl1-dev liblzma-dev libzstd-dev liblz4-dev \
         libbz2-dev zlib1g-dev libxml2-dev \
         python3-pyelftools libarchive-dev "linux-headers-$(uname -r)" \
-        pciutils ibverbs-utils iputils-arping mstflint
+        pciutils ibverbs-utils iputils-arping mstflint numactl
 fi
 if $initialize_submodules; then
     if [[ -f "$state/submodules.complete" ]]; then

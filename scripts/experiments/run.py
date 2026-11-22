@@ -107,9 +107,9 @@ def validate_config(c):
     for role in ('memcached', 'antagonist'):
         if c['allocation'][role + '_guaranteed'] > c['allocation'][role + '_cores']:
             raise ValueError(role + ' guaranteed cores exceed maximum cores')
-        if c['allocation'][role + '_guaranteed'] % 2:
+        if c['allocation']['use_smt'] and c['allocation'][role + '_guaranteed'] % 2:
             raise ValueError('Use even guarantees with SMT enabled')
-    if c['allocation']['client_cores'] % 2:
+    if c['allocation']['use_smt'] and c['allocation']['client_cores'] % 2:
         raise ValueError('Use an even client core count with SMT enabled')
     if c['allocation']['writer_cpu'] < 0 or c['batch_monitor']['cpu'] < -1:
         raise ValueError('Invalid CPU index')
@@ -185,12 +185,14 @@ def runtime_config(c, role):
     if role != 'antagonist':
         text += 'runtime_qdelay_us 10\n'
     if net['directpath'] and role != 'antagonist':
-        text += 'enable_directpath\n'
+        text += 'enable_directpath 1\n'
     return text
 
 
 def iokernel_command(c, node, root, server, logging):
     argv = [node['repo'] + '/iokerneld', 'ias', 'numanode', str(node['numa_node']), 'nicpci', node['nic_pci']]
+    if not c['allocation']['use_smt']:
+        argv.append('noht')
     if node['allowed_cpus']:
         argv.append(node['allowed_cpus'])
     settings = c['interventions'] if server else dict(bandwidth=False, hyperthread=False, timesharing=False, core_allocation=False)
@@ -283,7 +285,9 @@ class Node:
         return json.loads(proc.stdout)
 
     def start(self, label, argv, timeout, env=None):
-        self.rpc('start', label=label, argv=['stdbuf', '-oL', '-eL', *argv],
+        self.rpc('start', label=label, argv=['numactl', '--cpunodebind=' + str(self.config['numa_node']),
+                                             '--membind=' + str(self.config['numa_node']),
+                                             'stdbuf', '-oL', '-eL', *argv],
                  cwd=self.config['repo'], sudo=self.config['sudo'], timeout=timeout, env=env or {})
 
     def assert_alive(self, *labels):

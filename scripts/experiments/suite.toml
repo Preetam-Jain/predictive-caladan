@@ -7,16 +7,16 @@
 # enabled=true also performs setup before --run. Existing deployments are never overwritten.
 [setup]
 enabled = false
-deploy_code = true # Fresh checkout under the remote user's HOME; false for an existing checkout.
+deploy_code = false # Fresh checkout under the remote user's HOME; false for an existing checkout.
 install_dependencies = true
 initialize_submodules = true
 build_runtime = true
-apply_mlx5_fix = true # Known DPDK-forwarding fix; no firmware changes.
+apply_mlx5_fix = false # Known DPDK-forwarding fix; no firmware changes.
 configure_machine = true
 build_loadgen = true
 build_memcached = true
 build_stream_dram = true
-build_swaptions_gc = true # Requires runtime GC support; setup fails explicitly if absent.
+build_swaptions_gc = false # Requires runtime GC support; setup fails explicitly if absent.
 verify_machine = true
 run_smoke_tests = true
 build_jobs = 8
@@ -28,29 +28,29 @@ artifact_repository = "https://github.com/shenango/caladan-all.git"
 artifact_revision = "37a3822be053c37275f0aefea60da26246fd01cb"
 
 [nodes.server]
-host = "CHANGE_ME"
-user = "CHANGE_ME"
+host = "clnode254.clemson.cloudlab.us"
+user = "Preetam"
 port = 22
 identity_file = "" # Empty uses your SSH agent/default keys. Never put a password here.
-repo = "/home/preetam/predictive-caladan"
-artifact = "/home/preetam/caladan-all"
+repo = "/users/Preetam/predictive-caladan"
+artifact = "/users/Preetam/caladan-all"
 remote_results = "/tmp/caladan-experiments"
 sudo = true # Requires passwordless sudo -n for experiment commands.
-numa_node = 0
-nic_pci = "0000:03:00.1"
+numa_node = 1
+nic_pci = "0000:ca:00.0"
 allowed_cpus = "" # Optional IOKernel CPU list; set for your node's topology.
 
 [nodes.client]
-host = "CHANGE_ME"
-user = "CHANGE_ME"
+host = "clnode279.clemson.cloudlab.us"
+user = "Preetam"
 port = 22
 identity_file = ""
-repo = "/home/preetam/predictive-caladan"
-artifact = "/home/preetam/caladan-all"
+repo = "/users/Preetam/predictive-caladan"
+artifact = "/users/Preetam/caladan-all"
 remote_results = "/tmp/caladan-experiments"
 sudo = true
-numa_node = 0
-nic_pci = "0000:03:00.1"
+numa_node = 1
+nic_pci = "0000:ca:00.0"
 allowed_cpus = ""
 
 [network]
@@ -60,15 +60,16 @@ antagonist_ip = "192.168.1.103"
 netmask = "255.255.255.0"
 gateway = "192.168.1.1"
 port = 11211
-directpath = false
+directpath = true
 
 [allocation]
+use_smt = true # false uses one runtime worker per physical core (IOKernel noht).
 memcached_cores = 4
 memcached_guaranteed = 4
 antagonist_cores = 4
 antagonist_guaranteed = 4 # Must be nonzero when core_allocation is false.
 client_cores = 4
-writer_cpu = 4 # Always reserved, including logging-off/calibration runs.
+writer_cpu = 5 # Always reserved, including logging-off/calibration runs.
 
 [interventions]
 bandwidth = false
@@ -134,7 +135,7 @@ hashpower = 25
 nvalues = 32000000
 key_size = 20
 value_size = 2
-pctset = 30 # Per thousand: 30 means 3% SET, 97% GET; keys are uniform in this client.
+pctset = 2 # Per thousand: 0.2% SET, 99.8% GET; keys are uniform, matching the pinned artifact generator.
 client_connections = 64
 trace_requests = false # true emits completed-request traces; false emits normal summaries.
 

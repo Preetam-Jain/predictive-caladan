@@ -30,7 +30,7 @@ fi
 
 echo building RDMA-CORE
 cd rdma-core
-git -c user.name="x" -c user.email="x" am ../build/patches/rdma-core/*
+git apply ../build/patches/rdma-core/*
 if ! EXTRA_CMAKE_FLAGS="-DENABLE_STATIC=1 -DNO_PYVERBS=1 -DENABLE_RESOLVE_NEIGH=0" MAKEFLAGS=-j$CORES ./build.sh; then
   echo "Building rdma-core failed"
   echo "If you see \"Does not match the generator used previously\" try running \"make submodules-clean\" first"
@@ -54,7 +54,7 @@ export PKG_CONFIG_PATH=$PWD/rdma-core/build/lib/pkgconfig
 
 
 cd dpdk
-git -c user.name="x" -c user.email="x" am ../build/patches/dpdk/*
+git apply ../build/patches/dpdk/*
 meson build
 meson configure -Ddisable_drivers=$disable_driver -Dexamples='' -Denable_kmods=false -Dtests=false build
 meson configure -Dprefix=$PWD/build build
@@ -76,7 +76,7 @@ cd ..
 
 echo building PCM
 cd deps/pcm
-git -c user.name="x" -c user.email="x" am ../../build/patches/pcm/*
+git apply ../../build/patches/pcm/*
 mkdir -p build
 cd build
 cmake ..

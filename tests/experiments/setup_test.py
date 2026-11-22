@@ -59,6 +59,8 @@ class FakeNode:
 class SetupTest(unittest.TestCase):
     def setUp(self):
         self.config = launcher.load_config(launcher.TEMPLATE)
+        self.config['conditions'] = {name: True for name in launcher.CONDITIONS}
+        self.config['setup']['build_swaptions_gc'] = True
         self.config['setup']['deploy_code'] = False
         FakeNode.instances = []
         FakeNode.failure = None

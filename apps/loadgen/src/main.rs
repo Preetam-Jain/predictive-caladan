@@ -1367,10 +1367,17 @@ fn run_sample(
     drop(startup_tx);
 
     for _ in 0..nthreads {
-        if let Err(e) = startup_rx
-            .recv()
-            .expect("worker startup channel unexpectedly closed")
-        {
+        // Blocking recv() parks a kernel thread and can strand runtime work.
+        let status = loop {
+            match startup_rx.try_recv() {
+                Ok(status) => break status,
+                Err(std::sync::mpsc::TryRecvError::Empty) => backend.thread_yield(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("worker startup channel unexpectedly closed")
+                }
+            }
+        };
+        if let Err(e) = status {
             panic!("loadgen worker failed during startup: {}", e);
         }
     }

@@ -1,0 +1,22 @@
+# Run with: python3 scripts/experiments/peak_search.py --run
+# Resume with: python3 scripts/experiments/peak_search.py --resume results/DIRECTORY
+suite_config = "suite.toml"
+seed_results = "results/20261122T200506Z-core-screen-05fa54"
+reuse_screen = true
+physical_cores = [1, 4, 16, 34]
+p99_9_targets_us = [50.0, 100.0]
+start_rps = 10000
+minimum_rps = 1000
+maximum_rps = 12000000
+rate_multiplier = 2.0
+relative_precision = 0.05
+confirmations = 3
+warmup_seconds = 10
+measurement_seconds = 30
+minimum_send_fraction = 0.99
+minimum_response_fraction = 0.99
+minimum_schedule_adherence_percent = 99.0
+infrastructure_retries = 1
+maximum_trials_per_core = 60
+# Reservation ends at 11 PM Eastern; leave time for cleanup and collection.
+stop_before = "2026-11-23T03:45:00+00:00"

@@ -40,6 +40,7 @@ class LauncherTest(unittest.TestCase):
             launcher.validate_config(c)
 
     def test_paired_plan_and_seed(self):
+        self.config["conditions"] = {name: True for name in launcher.CONDITIONS}
         runs = launcher.plan(self.config, 1000000)
         self.assertEqual(len(runs), 54)
         self.assertEqual(runs, launcher.plan(self.config, 1000000))
@@ -59,6 +60,13 @@ class LauncherTest(unittest.TestCase):
             self.assertEqual(argv[index + 1], str(c['allocation']['writer_cpu']))
             self.assertEqual(argv[index + 2], '/tmp/run/capture' if logging else '-')
         self.assertIn('runtime_guaranteed_kthreads 4', launcher.runtime_config(c, 'antagonist'))
+        c['network']['directpath'] = True
+        self.assertIn('enable_directpath 1\n', launcher.runtime_config(c, 'memcached'))
+        self.assertIn('enable_directpath 1\n', launcher.runtime_config(c, 'client'))
+        c['allocation']['use_smt'] = False
+        c['allocation']['memcached_cores'] = c['allocation']['memcached_guaranteed'] = 1
+        launcher.validate_config(c)
+        self.assertIn('noht', launcher.iokernel_command(c, c['nodes']['server'], '/tmp/run', True, False))
 
     def test_summaries_and_overload(self):
         line = 'zero, 1000, 990, 10, 100.0, 1, 2, 3, 4, 5, 6, 10, 1700000000, 1234567890123456789\n'
@@ -145,6 +153,10 @@ class OfflineSSHIntegrationTest(unittest.TestCase):
             root = Path(directory)
             tools = root / 'tools'
             tools.mkdir()
+            # The offline fixture tests orchestration without changing host NUMA policy.
+            numactl = tools / 'numactl'
+            numactl.write_text('#!/bin/sh\nshift\nshift\nexec "$@"\n')
+            numactl.chmod(0o755)
             ssh = tools / 'ssh'
             ssh.write_text('#!/usr/bin/env python3\nimport os,sys\nos.execvp("sh",["sh","-c",sys.argv[-1]])\n')
             ssh.chmod(0o755)

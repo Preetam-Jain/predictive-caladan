@@ -112,8 +112,15 @@ fi
 if $memcached; then
     (
         cd "$artifact/memcached"
+        for compatibility_patch in "$repo"/build/patches/memcached/*.patch; do
+            if ! git apply --reverse --check "$compatibility_patch" 2>/dev/null; then
+                git apply --check "$compatibility_patch"
+                git apply "$compatibility_patch"
+            fi
+        done
         ./autogen.sh
-        ./configure --with-shenango="$repo"
+        CFLAGS="${CFLAGS:--g -O2} -Wno-error=deprecated-declarations" \
+            ./configure --with-shenango="$repo"
         make -j"$jobs"
     )
 fi

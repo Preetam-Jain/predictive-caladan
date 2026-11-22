@@ -344,9 +344,13 @@ int ias_bw_init(void)
 	/* ensure threads created by pcm are pinned to control core */
 	pin_thread(0, sched_ctrl_core);
 
-	ret = pcm_caladan_init(0);
+	/* numanode selects the workload socket and its memory counters. */
+	ret = pcm_caladan_init(managed_numa_node < 0 ? 0 : managed_numa_node);
 	if (ret)
 		return ret;
+
+	log_info("ias: bandwidth counters on socket %d",
+	         managed_numa_node < 0 ? 0 : managed_numa_node);
 
 	/* We monitor 1 channel, so multiply measurements by nr_channels to estimate real bw */
 	nr_channels = pcm_caladan_get_active_channel_count();
