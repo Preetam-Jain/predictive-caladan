@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class QueueTest(unittest.TestCase):
     def test_contributions_and_shared_directpath(self):
         source = (ROOT / 'iokernel/sched.c').read_text()
-        start = source.index('static void\nsched_measure_kthread_delay')
+        start = source.index('static bool\nsched_measure_kthread_delay')
         end = source.index('#define EWMA_WEIGHT', start)
         harness = r'''
 #include <assert.h>
@@ -18,9 +18,18 @@ class QueueTest(unittest.TestCase):
 #include "iokernel/defs.h"
 #include "iokernel/telemetry.h"
 static uint64_t cur_tsc = 1000;
+struct iokernel_cfg cfg;
 int cycles_per_us = 1;
 static uint64_t values[5];
 static uint32_t sample_flags;
+static uint32_t failure_reason, failure_count;
+void telemetry_queue_snapshot_failure(uint64_t tsc, uint32_t pid, uint32_t tid,
+                                      uint32_t core, uint32_t reason)
+{
+    assert(tsc == cur_tsc && pid == 42 && tid == 43 && core == 7);
+    failure_reason = reason;
+    failure_count++;
+}
 void telemetry_queue(uint64_t tsc, uint64_t runnable, uint64_t rx,
                      uint64_t timer, uint64_t directpath, uint64_t storage,
                      uint32_t pid, uint32_t tid,
@@ -85,6 +94,18 @@ int main(void)
     sched_measure_kthread_delay(&p, &th, &total, &shared, &busy, &standing, &next);
     assert(total == 0 && sample_flags == 0 && next == 2000);
     for (unsigned int i = 0; i < 5; i++) assert(values[i] == 0);
+
+    /* A writer in progress is rejected once, keeps prior queue history,
+     * and is explicitly unavailable while other queue signals survive. */
+    cfg.queue_snapshot_failure_logging = true;
+    q.rq_seq = 1; q.rq_head = 9; q.oldest_tsc = 1;
+    uint32_t old_head = th.last_rq_head;
+    total = 0; busy = standing = false;
+    assert(!sched_measure_kthread_delay(&p, &th, &total, &shared, &busy, &standing, &next));
+    assert(q.rq_seq == 1 && th.last_rq_head == old_head);
+    assert(sample_flags == 8 && failure_count == 1);
+    assert(failure_reason == RQ_SNAPSHOT_WRITER_BUSY);
+    assert(total == 0);
     return 0;
 }
 '''

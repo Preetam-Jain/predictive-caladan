@@ -18,7 +18,7 @@
  * struct control_hdr, please increment the version number!
  */
 
-#define CONTROL_HDR_VERSION 14
+#define CONTROL_HDR_VERSION 15
 
 /* The abstract namespace path for the control socket. */
 #define CONTROL_SOCK_PATH	"/run/iokernel.sock"
@@ -31,7 +31,7 @@ struct q_ptrs {
 	uint32_t		directpath_rx_tail;
 	uint64_t		next_timer_tsc;
 	uint32_t		storage_tail;
-	uint32_t		pad1;
+	uint32_t		rq_seq; /* odd while runnable-queue metadata changes */
 	uint64_t		oldest_tsc;
 	uint64_t		rcu_gen;
 	uint64_t		run_start_tsc;
@@ -47,6 +47,47 @@ struct q_ptrs {
 
 BUILD_ASSERT(sizeof(struct q_ptrs) == 2 * CACHE_LINE_SIZE);
 BUILD_ASSERT(offsetof(struct q_ptrs, curr_grant_gen) % CACHE_LINE_SIZE == 0);
+
+/* Writers must hold the owning kthread's queue lock. */
+static inline void rq_write_begin(struct q_ptrs *q)
+{
+	assert(!(ACCESS_ONCE(q->rq_seq) & 1));
+	ACCESS_ONCE(q->rq_seq)++;
+	wmb();
+}
+
+static inline void rq_write_end(struct q_ptrs *q)
+{
+	store_release(&q->rq_seq, q->rq_seq + 1);
+}
+
+struct rq_snapshot {
+	uint32_t head, tail;
+	uint64_t oldest_tsc;
+};
+
+enum rq_snapshot_result {
+	RQ_SNAPSHOT_VALID,
+	RQ_SNAPSHOT_WRITER_BUSY,
+	RQ_SNAPSHOT_CHANGED,
+};
+
+/* One attempt only. Output may be used only after RQ_SNAPSHOT_VALID. */
+static inline enum rq_snapshot_result
+rq_read_snapshot(const struct q_ptrs *q, struct rq_snapshot *snapshot)
+{
+	uint32_t before = load_acquire(&q->rq_seq);
+
+	if (before & 1)
+		return RQ_SNAPSHOT_WRITER_BUSY;
+	snapshot->head = ACCESS_ONCE(q->rq_head);
+	snapshot->tail = ACCESS_ONCE(q->rq_tail);
+	snapshot->oldest_tsc = ACCESS_ONCE(q->oldest_tsc);
+	rmb();
+	if (before != ACCESS_ONCE(q->rq_seq))
+		return RQ_SNAPSHOT_CHANGED;
+	return RQ_SNAPSHOT_VALID;
+}
 
 struct congestion_info {
 	float			load;

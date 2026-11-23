@@ -1,12 +1,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/uio.h>
 #include <base/time.h>
@@ -43,6 +46,11 @@ struct pmc_failure_record {
     uint32_t reason;
 };
 
+struct queue_snapshot_failure_record {
+    uint64_t tsc;
+    uint32_t pid, tid, core, reason;
+};
+
 /* CPU IDs fit in 16 bits; keeping reason/core compact avoids padding. */
 struct sched_event_record {
     uint64_t tsc;
@@ -56,7 +64,7 @@ struct sched_event_record {
 struct queue_record {
     uint64_t tsc, runnable_cycles, rx_cycles, timer_cycles;
     uint64_t directpath_cycles, storage_cycles;
-    uint32_t pid, tid, core, flags; /* flags: active=1, has_work=2, standing=4 */
+    uint32_t pid, tid, core, flags; /* active=1, work=2, standing=4, invalid runnable=8 */
 };
 /* Observations, not completed-task durations. Even RCU generations mean idle. */
 struct task_record {
@@ -67,7 +75,7 @@ struct delay_record {
     uint64_t tsc, rx_cycles;
     double max_us, min_us, avg_us;
     uint32_t pid, active_threads, flags, reserved;
-    /* flags: has_work=1, parked_busy=2, standing_queue=4 */
+    /* flags: has_work=1, parked_busy=2, standing_queue=4, invalid runnable=8 */
 };
 
 enum stream_type {
@@ -78,6 +86,7 @@ enum stream_type {
     STREAM_QUEUE = 5,
     STREAM_TASK = 6,
     STREAM_DELAY = 7,
+    STREAM_QUEUE_SNAPSHOT_FAILURE = 8,
 };
 
 enum failure_reason {
@@ -110,6 +119,7 @@ struct file_header {
 _Static_assert(sizeof(struct bandwidth_record) == 16, "bandwidth record size assert failed");
 _Static_assert(sizeof(struct llc_record) == 64, "llc record size assert failed");
 _Static_assert(sizeof(struct pmc_failure_record) == 24, "pmc failure record size assert failed");
+_Static_assert(sizeof(struct queue_snapshot_failure_record) == 24, "queue snapshot failure record size assert failed");
 _Static_assert(sizeof(struct sched_event_record) == 24, "scheduler event record size assert failed");
 _Static_assert(sizeof(struct queue_record) == 64, "queue record size assert failed");
 _Static_assert(sizeof(struct task_record) == 40, "task record size assert failed");
@@ -125,8 +135,8 @@ _Static_assert(offsetof(struct file_header, cores) == sizeof(struct file_header)
 #define SCHED_EVENT_CAPACITY (1U << 18) // 262,144
 #define FAILURE_CAPACITY (1U << 12) // 4,096
 
-/* Version 8 adds queue, task elapsed-time, and process delay streams. */
-#define FILE_FORMAT_VERSION 8U
+/* Version 9 adds optional per-observation queue snapshot failure records. */
+#define FILE_FORMAT_VERSION 9U
 #define MICROSECONDS_PER_SECOND 1000000ULL
 /* Bandwidth comes from the memory controller, not a selected core PMC event. */
 #define PMC_SELECTOR_NOT_APPLICABLE 0ULL
@@ -196,6 +206,13 @@ static struct stream delay_stream = {
     .capacity = SCHED_EVENT_CAPACITY,
     .fd = -1,
 };
+static struct stream queue_snapshot_failure_stream = {
+    .suffix = ".queue-snapshot-failure.bin",
+    .type = STREAM_QUEUE_SNAPSHOT_FAILURE,
+    .record_bytes = sizeof(struct queue_snapshot_failure_record),
+    .capacity = SCHED_EVENT_CAPACITY,
+    .fd = -1,
+};
 static struct stream *const streams[] = {
     &bandwidth_stream,
     &llc_stream,
@@ -204,7 +221,10 @@ static struct stream *const streams[] = {
     &queue_stream,
     &task_stream,
     &delay_stream,
+    &queue_snapshot_failure_stream,
 };
+/* The optional stream is last; disabled logging allocates no ring or file. */
+static size_t nr_streams = ARRAY_SIZE(streams) - 1;
 
 int telemetry_core = -1;
 const char *telemetry_path;
@@ -281,7 +301,21 @@ static int writev_all(int fd, struct iovec *parts, int part_count)
     return 0;
 }
 
-static int stream_open(struct stream *stream)
+static int writer_numa_node(void)
+{
+    char path[96];
+
+    /* A CPU's NUMA node can differ from its physical package ID. */
+    for (int node = 0; node < NNUMA; node++) {
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/node%d",
+                 telemetry_core, node);
+        if (access(path, F_OK) == 0)
+            return node;
+    }
+    return -1;
+}
+
+static int stream_open(struct stream *stream, int writer_node)
 {
     char *path;
     int error;
@@ -290,15 +324,26 @@ static int stream_open(struct stream *stream)
     if (stream->batch_size > stream->capacity)
         stream->batch_size = stream->capacity;
 
-    error = posix_memalign((void **)&stream->records, 64,
-                          stream->capacity * stream->record_bytes);
-    if (error) {
-        log_err("telemetry%s: cannot allocate record buffer (%zu bytes): %s",
-                stream->suffix, stream->capacity * stream->record_bytes, strerror(error));
+    size_t ring_bytes = stream->capacity * stream->record_bytes;
+    unsigned long node_mask = 1UL << writer_node;
+    void *records = mmap(NULL, ring_bytes, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (records == MAP_FAILED) {
+        error = errno;
+        log_err("telemetry%s: cannot map ring (%zu bytes): %s",
+                stream->suffix, ring_bytes, strerror(error));
         return error;
     }
-    /* First-touch after dataplane initialization follows the socket's policy. */
-    memset(stream->records, 0, stream->capacity * stream->record_bytes);
+    if (syscall(SYS_mbind, records, ring_bytes, MPOL_BIND, &node_mask, NNUMA, 0UL)) {
+        error = errno;
+        munmap(records, ring_bytes);
+        log_err("telemetry%s: cannot bind ring to NUMA node %d: %s",
+                stream->suffix, writer_node, strerror(error));
+        return error;
+    }
+    /* Fault the ring pages under the mapping policy before enabling capture. */
+    memset(records, 0, ring_bytes);
+    stream->records = records;
     if (asprintf(&path, "%s%s", telemetry_path, stream->suffix) < 0) {
         log_err("telemetry%s: cannot allocate output path: %s",
                 stream->suffix, strerror(ENOMEM));
@@ -405,14 +450,15 @@ static int complete_stream(struct stream *stream)
     return error;
 }
 
-static void *writer(void *unused)
+static void *writer(void *initial_error)
 {
-    int error = 0;
-    (void)unused;
+    int error = (int)(intptr_t)initial_error;
+    if (error)
+        goto close_streams;
     for (;;) {
         bool done = atomic_load_explicit(&finished, memory_order_acquire);
         bool made_progress = false;
-        for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
+        for (size_t i = 0; i < nr_streams; i++) {
             error = drain_batch(streams[i], done, &made_progress);
             if (error) {
                 log_err("telemetry%s: write failed: %s", streams[i]->suffix, strerror(error));
@@ -424,7 +470,7 @@ static void *writer(void *unused)
         if (!made_progress)
             __asm__ volatile("pause");
     }
-    for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
+    for (size_t i = 0; i < nr_streams; i++) {
         error = complete_stream(streams[i]);
         if (error) {
             log_err("telemetry%s: finalization failed: %s", streams[i]->suffix, strerror(error));
@@ -435,7 +481,7 @@ close_streams:
     /* Report errors before further cleanup so the scheduler stops producing. */
     if (error)
         atomic_store_explicit(&writer_error, error, memory_order_release);
-    for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
+    for (size_t i = 0; i < nr_streams; i++) {
         if (close(streams[i]->fd)) {
             int close_error = errno;
             log_err("telemetry%s: cannot close output file: %s",
@@ -451,12 +497,24 @@ close_streams:
         atomic_store_explicit(&writer_error, error, memory_order_release);
         log_err("telemetry: capture failed: %s", strerror(error));
     } else {
-        for (size_t i = 0; i < ARRAY_SIZE(streams); i++)
+        for (size_t i = 0; i < nr_streams; i++)
             log_info("telemetry%s: records=%lu dropped=%lu", streams[i]->suffix,
                      streams[i]->produced, streams[i]->dropped);
         log_info("telemetry: all streams drained and closed");
     }
     return NULL;
+}
+
+static void *writer_start(void *unused)
+{
+    int error = 0;
+    (void)unused;
+    /* Prefer writer-local memory for allocations made by this thread. */
+    if (syscall(SYS_set_mempolicy, MPOL_LOCAL, NULL, 0)) {
+        error = errno;
+        log_err("telemetry: cannot select writer-local memory: %s", strerror(error));
+    }
+    return writer((void *)(intptr_t)error);
 }
 
 int telemetry_init(void)
@@ -466,19 +524,25 @@ int telemetry_init(void)
     cpu_set_t cpu_set;
     int error;
 
+    nr_streams = ARRAY_SIZE(streams) - !cfg.queue_snapshot_failure_logging;
     if (!telemetry_path || !strcmp(telemetry_path, "-"))
         return 0;
     if (cfg.nobw) {
         log_err("telemetry: bandwidth monitoring is unavailable");
         return -EINVAL;
     }
+    int writer_node = writer_numa_node();
+    if (writer_node < 0) {
+        log_err("telemetry: cannot resolve NUMA node for writer CPU %d", telemetry_core);
+        return -ENODEV;
+    }
     error = generate_experiment_id();
     if (error) {
         log_err("telemetry: cannot generate experiment UUID: %s", strerror(error));
         return -error;
     }
-    for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
-        error = stream_open(streams[i]);
+    for (size_t i = 0; i < nr_streams; i++) {
+        error = stream_open(streams[i], writer_node);
         if (error)
             goto fail;
     }
@@ -494,7 +558,7 @@ int telemetry_init(void)
         log_err("telemetry: cannot set writer affinity to core %d: %s",
                 telemetry_core, strerror(error));
     } else {
-        error = pthread_create(&thread, &attributes, writer, NULL);
+        error = pthread_create(&thread, &attributes, writer_start, NULL);
         if (error)
             log_err("telemetry: cannot create writer thread: %s", strerror(error));
     }
@@ -506,11 +570,13 @@ int telemetry_init(void)
     return 0;
 fail:
     log_err("telemetry: initialization failed: %s", strerror(error));
-    for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
+    for (size_t i = 0; i < nr_streams; i++) {
         if (streams[i]->fd >= 0)
             close(streams[i]->fd);
         streams[i]->fd = -1;
-        free(streams[i]->records);
+        if (streams[i]->records)
+            munmap(streams[i]->records,
+                   streams[i]->capacity * streams[i]->record_bytes);
         streams[i]->records = NULL;
         free(streams[i]->header);
         streams[i]->header = NULL;
@@ -598,6 +664,21 @@ void telemetry_sched_event(uint32_t core, uint32_t pid, uint64_t gen,
         .reason = reason,
     };
     submit(&sched_stream, &record);
+}
+
+void telemetry_queue_snapshot_failure(uint64_t tsc, uint32_t pid, uint32_t tid,
+                                      uint32_t core, uint32_t reason)
+{
+    if (!cfg.queue_snapshot_failure_logging || !active)
+        return;
+    struct queue_snapshot_failure_record record = {
+        .tsc = tsc,
+        .pid = pid,
+        .tid = tid,
+        .core = core,
+        .reason = reason,
+    };
+    submit(&queue_snapshot_failure_stream, &record);
 }
 
 void telemetry_queue(uint64_t tsc, uint64_t runnable_cycles, uint64_t rx_cycles,

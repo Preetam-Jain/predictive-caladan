@@ -47,6 +47,7 @@ struct iokernel_cfg {
 	bool	bw_intervention; /* enable bandwidth throttling; default false */
 	bool	ht_intervention; /* enable SMT sibling idling; default false */
 	bool	timesharing; /* enable user-thread quantum enforcement; default false */
+	bool	queue_snapshot_failure_logging; /* binary record per rejected read; default false */
 	bool	core_allocation; /* enable automatic core expansion/preemption; default false */
 	bool	noidlefastwake; /* disable fast wakeups for idle processes */
 	bool	ias_prefer_selfpair; /* prefer self-pairings */

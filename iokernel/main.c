@@ -195,6 +195,7 @@ static void print_usage(void)
     printf("  timesharing on|off (default off)\n");
     printf("  core_allocation on|off (default off; off fixes guaranteed_cores)\n");
     printf("  telemetry CPU PREFIX SECONDS (PREFIX=- reserves core only)\n");
+	printf("  queue_snapshot_failure_logging on|off (default off; binary record per failed read)\n");
 	printf("usage: POLICY [noht/core_list/nobw/mutualpair]\n");
 	printf("\tsimple: a simplified scheduler policy intended for testing\n");
 	printf("\tias: the Caladan scheduler policy (manages CPU interference)\n");
@@ -232,6 +233,13 @@ int main(int argc, char *argv[])
 	for (i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "noht")) {
 			cfg.noht = true;
+		} else if (!strcmp(argv[i], "queue_snapshot_failure_logging")) {
+			if (i + 1 >= argc ||
+			    (strcmp(argv[i + 1], "on") && strcmp(argv[i + 1], "off"))) {
+				fprintf(stderr, "queue_snapshot_failure_logging requires on or off\n");
+				return -EINVAL;
+			}
+			cfg.queue_snapshot_failure_logging = !strcmp(argv[++i], "on");
 		} else if (!strcmp(argv[i], "bw_intervention") ||
 		           !strcmp(argv[i], "ht_intervention") ||
 		           !strcmp(argv[i], "timesharing") ||
@@ -357,6 +365,11 @@ int main(int argc, char *argv[])
 	}
 
 	/* Report each invalid telemetry configuration before exiting. */
+	if (cfg.queue_snapshot_failure_logging &&
+	    (!telemetry_path || !strcmp(telemetry_path, "-"))) {
+		fprintf(stderr, "queue_snapshot_failure_logging requires a telemetry output prefix\n");
+		return -EINVAL;
+	}
 	if (telemetry_path) {
 		if (sched_ops != &ias_ops) {
 			fprintf(stderr, "telemetry: requires the ias scheduler policy\n");

@@ -3,6 +3,7 @@
  */
 
 #include <float.h>
+#include <math.h>
 #include <stdio.h>
 
 #include <base/stddef.h>
@@ -486,7 +487,7 @@ sched_update_kthread_metrics(struct thread *th, bool work_pending)
 	th->metrics.kthread_elapsed_us = (cur_tsc - th->change_tsc) / cycles_per_us;
 }
 
-static void
+static bool
 sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_delay,
                             uint64_t *rxq_delay, bool *has_work,
                             bool *standing_queue, uint64_t *next_timer)
@@ -500,23 +501,31 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 	uint64_t directpath_delay_cycles = 0;
 	uint64_t storage_delay_cycles;
 	uint32_t flags = 0;
+	struct rq_snapshot snapshot;
+	enum rq_snapshot_result result = rq_read_snapshot(th->q_ptrs, &snapshot);
+	bool snapshot_valid = result == RQ_SNAPSHOT_VALID;
+
+	if (!snapshot_valid)
+		telemetry_queue_snapshot_failure(cur_tsc, p->pid, th->tid, th->core, result);
 
 	/* UTHREAD: measure delay */
-	last_tail = th->last_rq_tail;
-	cur_tail = load_acquire(&th->q_ptrs->rq_tail);
-	last_head = th->last_rq_head;
-	cur_head = ACCESS_ONCE(th->q_ptrs->rq_head);
-	th->last_rq_head = cur_head;
-	th->last_rq_tail = cur_tail;
+	if (snapshot_valid) {
+		last_tail = th->last_rq_tail;
+		cur_tail = snapshot.tail;
+		last_head = th->last_rq_head;
+		cur_head = snapshot.head;
+		th->last_rq_head = cur_head;
+		th->last_rq_tail = cur_tail;
 
-	/* UTHREAD: update old standing queue signal */
-	*has_work |= cur_head != cur_tail;
-	*standing_queue |= wraps_lt(cur_tail, last_head);
+		/* UTHREAD: update old standing queue signal */
+		*has_work |= cur_head != cur_tail;
+		*standing_queue |= wraps_lt(cur_tail, last_head);
 
-	/* UTHREAD: update new queueing delay signal */
-	if (cur_head != cur_tail) {
-		tmp = ACCESS_ONCE(th->q_ptrs->oldest_tsc);
-		*thread_delay += calc_delay_tsc(tmp);
+		/* UTHREAD: update new queueing delay signal */
+		if (cur_head != cur_tail) {
+			tmp = snapshot.oldest_tsc;
+			*thread_delay += calc_delay_tsc(tmp);
+		}
 	}
 
 	runnable_delay_cycles = *thread_delay - prev_delay;
@@ -591,11 +600,13 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 		flags |= 0b010U;
 	if (*standing_queue)
 		flags |= 0b100U;
+	if (!snapshot_valid)
+		flags |= 0b1000U; /* runnable_cycles unavailable, not a zero-delay sample */
 
 	telemetry_queue(cur_tsc, runnable_delay_cycles, rx_delay_cycles,
 	                timer_delay_cycles, directpath_delay_cycles, storage_delay_cycles,
 	                p->pid, th->tid, th->core, flags);
-
+	return snapshot_valid;
 }
 
 #define EWMA_WEIGHT     0.1f
@@ -627,6 +638,7 @@ static void sched_measure_delay(struct proc *p)
 	struct delay_info dl;
 	struct thread *th;
 	uint64_t rxq_delay = 0, consumed_strides = 0, posted_strides, next_poll_tsc;
+	bool snapshot_valid = true;
 	unsigned int i;
 
 	if (!proc_sched_should_poll(p, cur_tsc))
@@ -659,8 +671,8 @@ static void sched_measure_delay(struct proc *p)
 
 		void *prefetch1 = directpath_poll_proc_prefetch_th0(p, i);
 
-		sched_measure_kthread_delay(p, th, &delay, &rxq_delay, &busy,
-			                        &dl.standing_queue, &next_timer_tsc);
+		snapshot_valid &= sched_measure_kthread_delay(p, th, &delay, &rxq_delay, &busy,
+			                                     &dl.standing_queue, &next_timer_tsc);
 
 		consumed_strides += ACCESS_ONCE(th->q_ptrs->directpath_strides_consumed);
 
@@ -727,10 +739,15 @@ static void sched_measure_delay(struct proc *p)
 	dl.avg_delay_us /= (double)(cycles_per_us * sched_threads_active(p));
 
 	/* Telemetry: capture the final process delay and flags before policy notification. */
-	telemetry_delay(cur_tsc, rxq_delay, dl.max_delay_us, dl.min_delay_us,
-	                dl.avg_delay_us, p->pid, sched_threads_active(p),
+	telemetry_delay(cur_tsc, rxq_delay, snapshot_valid ? dl.max_delay_us : NAN,
+	                snapshot_valid ? dl.min_delay_us : NAN,
+	                snapshot_valid ? dl.avg_delay_us : NAN,
+	                p->pid, sched_threads_active(p),
 	                (dl.has_work ? 1U : 0U) | (dl.parked_thread_busy ? 2U : 0U) |
-	                (dl.standing_queue ? 4U : 0U));
+	                (dl.standing_queue ? 4U : 0U) | (snapshot_valid ? 0U : 8U));
+	/* Do not feed a partial runnable-delay observation into the policy. */
+	if (!snapshot_valid)
+		return;
 	/* report delay back to runtime */
 	sched_report_metrics(p, dl.max_delay_us);
 
@@ -1089,12 +1106,13 @@ int sched_init(void)
 	}
 
     if (telemetry_core >= 0) {
-        unsigned int sibling = sched_siblings[telemetry_core];
-        if (!bitmap_test(sched_allowed_cores, telemetry_core)) {
-            log_err("telemetry: writer CPU %d is unavailable; select an allowed application CPU on the managed socket",
+        if (telemetry_core >= cpu_count ||
+            telemetry_core == sched_ctrl_core || telemetry_core == sched_dp_core) {
+            log_err("telemetry: writer CPU %d is unavailable or reserved by IOKernel",
                     telemetry_core);
             return -EINVAL;
         }
+        unsigned int sibling = sched_siblings[telemetry_core];
         if (sibling == sched_ctrl_core || sibling == sched_dp_core) {
             log_err("telemetry: writer CPU %d shares a physical core with IOKernel CPU %u; select a different physical core",
                     telemetry_core, sibling);

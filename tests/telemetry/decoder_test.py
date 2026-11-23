@@ -93,6 +93,27 @@ class DecoderTest(unittest.TestCase):
     def test_incomplete(self):
         self.assertNotEqual(self.decode(fixture([], complete=False)).returncode, 0)
 
+    def test_version9_snapshot_failure(self):
+        record = struct.pack('<Q4I', 100, 42, 43, 7, 2)
+        header = bytearray(fixture([], version=9)[:96])
+        struct.pack_into('<II', header, 16, len(record), 8)
+        result = self.decode(header + record)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('tsc,pid,tid,core,reason', result.stdout)
+        self.assertIn('100,42,43,7,2', result.stdout)
+        struct.pack_into('<I', header, 8, 8)
+        self.assertNotEqual(self.decode(header + record).returncode, 0)
+
+    def test_invalid_runnable_is_missing_not_zero(self):
+        header = bytearray(fixture([], version=8)[:96])
+        record = struct.pack('<6Q4I', 100, 0, 2, 3, 4, 5, 42, 43, 7, 8)
+        struct.pack_into('<II', header, 16, len(record), 5)
+        result = self.decode(header + record)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.splitlines()[1].split(',')
+        self.assertEqual(fields[1], '')
+        self.assertEqual(fields[2:6], ['2', '3', '4', '5'])
+
     def test_truncation_and_extra_data(self):
         data = fixture([1, 2])
         for corrupted in (data[:99], data[:-1], data + b'x'):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream a version-4/5/6/7/8 Caladan telemetry stream file to CSV."""
+"""Stream a version-4 through version-9 Caladan telemetry file to CSV."""
 from collections import namedtuple
 import argparse
 import csv
@@ -24,6 +24,7 @@ LAYOUTS = {
         ('tsc', 'rx_cycles', 'max_us', 'min_us', 'avg_us', 'pid', 'active_threads',
          'flags', 'reserved')),
     4: (struct.Struct('<QQIHH'), ('tsc', 'generation', 'pid', 'core', 'reason')),
+    8: (struct.Struct('<Q4I'), ('tsc', 'pid', 'tid', 'core', 'reason')),
 }
 
 
@@ -59,11 +60,12 @@ def read_header(source):
     if len(raw) != HEADER.size:
         raise ValueError('truncated header')
     header = FileHeader._make(HEADER.unpack(raw))
-    if header.magic != b'CALATLM\0' or header.version not in (4, 5, 6, 7, 8):
-        raise ValueError('unsupported capture format (requires version 4, 5, 6, 7, or 8)')
+    if header.magic != b'CALATLM\0' or header.version not in (4, 5, 6, 7, 8, 9):
+        raise ValueError('unsupported capture format (requires version 4 through 9)')
     if (header.stream_type not in LAYOUTS
             or (header.version < 8 and header.stream_type > 4)
-            or (header.version == 4 and header.stream_type == 4)):
+            or (header.version == 4 and header.stream_type == 4)
+            or (header.version < 9 and header.stream_type == 8)):
         raise ValueError(f'unknown stream type {header.stream_type}')
     layout, _ = record_layout(header)
     if (header.header_bytes != HEADER.size + header.nr_cores * 4
@@ -106,7 +108,13 @@ def decode(source, output):
           f'bandwidth_multiplier={header.bandwidth_multiplier}', file=sys.stderr)
     csv_output = csv.writer(output)
     csv_output.writerow(record_layout(header)[1])
-    csv_output.writerows(iter_records(source, header))
+    for record in iter_records(source, header):
+        values = list(record)
+        if header.stream_type == 5 and values[-1] & 8:
+            values[1] = None  # unavailable runnable delay, not zero
+        if header.stream_type == 7 and values[-2] & 8:
+            values[2:5] = [None, None, None]
+        csv_output.writerow(values)
     print(f'completed: records={header.produced} dropped={header.dropped}', file=sys.stderr)
 
 
@@ -117,7 +125,9 @@ def capture_streams(prefix):
     with open(f'{prefix}.bw.bin', 'rb') as source:
         header, _ = read_header(source)
     if header.version >= 8:
-        return STREAM_FILES
+        optional = prefix + '.queue-snapshot-failure.bin'
+        return STREAM_FILES + ((('queue-snapshot-failure', 8),)
+                               if header.version >= 9 and os.path.exists(optional) else ())
     return STREAM_FILES[:4] if header.version >= 5 else STREAM_FILES[:3]
 
 
