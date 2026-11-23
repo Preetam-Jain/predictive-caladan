@@ -36,6 +36,8 @@ struct thread {
 	size_t			waitq_micros;
 	uint64_t	tlsvar;
 	uint64_t	fsbase;
+	struct list_node gc_link;
+	unsigned int gc_owner;
 };
 
 extern uint64_t thread_get_total_cycles(thread_t *th);

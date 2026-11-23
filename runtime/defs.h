@@ -22,6 +22,7 @@
 #include <runtime/runtime.h>
 #include <runtime/thread.h>
 #include <runtime/rcu.h>
+#include <runtime/gc.h>
 #include <runtime/preempt.h>
 
 
@@ -341,7 +342,8 @@ struct kthread {
 	struct mbufq		txcmdq_overflow;
 	unsigned int		rcu_gen;
 	unsigned int		curr_cpu;
-	unsigned long		pad1[2];
+	uint64_t		local_gc_gen;
+	unsigned long		pad1[1];
 
 	/* 3rd cache-line */
 	struct lrpc_chan_out	txpktq;
@@ -442,6 +444,8 @@ static __always_inline __nofp bool preempt_cede_needed(struct kthread *k)
 /* preempt_yield_needed - check if current uthread should yield */
 static __always_inline __nofp bool preempt_yield_needed(struct kthread *k)
 {
+	if (unlikely(get_gc_gen() != ACCESS_ONCE(k->local_gc_gen)))
+		return true;
         return ACCESS_ONCE(k->q_ptrs->yield_rcu_gen) == k->rcu_gen;
 }
 
@@ -611,6 +615,8 @@ static inline bool rx_poll(struct kthread *k)
 
 static inline bool rx_poll_locked(struct kthread *k)
 {
+	if (unlikely(is_world_stopped()))
+		return false;
 	assert(spin_lock_held(&myk()->lock));
 	return net_ops.rx_poll_locked && net_ops.rx_poll_locked(kthread_idx(k));
 }
@@ -705,6 +711,8 @@ extern int kthread_init(void);
 extern int ioqueues_init(void);
 extern int runtime_stack_init(void);
 extern int sched_init(void);
+extern int gc_init(void);
+extern bool cfg_gc_enabled;
 extern int preempt_init(void);
 extern int net_init(void);
 extern int udp_init(void);

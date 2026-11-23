@@ -176,6 +176,9 @@ static void drain_overflow(struct kthread *l)
 
 static bool work_available(struct kthread *k, uint64_t now_tsc)
 {
+	if (unlikely(get_gc_gen() != ACCESS_ONCE(k->local_gc_gen)) &&
+	    ACCESS_ONCE(k->parked))
+		return true;
 	return ACCESS_ONCE(k->rq_tail) != ACCESS_ONCE(k->rq_head) ||
 	       softirq_pending(k, now_tsc);
 }
@@ -190,6 +193,11 @@ static void update_oldest_tsc(struct kthread *k)
 	if (load_acquire(&k->rq_head) != k->rq_tail) {
 		th = k->rq[k->rq_tail % RUNTIME_RQ_SIZE];
 		ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
+	} else if (!list_empty(&k->rq_overflow)) {
+		th = list_top(&k->rq_overflow, thread_t, link);
+		ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
+	} else {
+		ACCESS_ONCE(k->q_ptrs->oldest_tsc) = UINT64_MAX;
 	}
 }
 
@@ -201,6 +209,8 @@ static uint32_t drain_threads(struct kthread *k, struct list_head *l, uint32_t n
 
 	rq_head = load_acquire(&k->rq_head);
 	rq_tail = k->rq_tail;
+	if (update_tail)
+		rq_write_begin(k->q_ptrs);
 
 	for (i = 0; i < nr; i++) {
 		if (likely(wraps_lt(rq_tail, rq_head))) {
@@ -216,6 +226,8 @@ static uint32_t drain_threads(struct kthread *k, struct list_head *l, uint32_t n
 	if (update_tail) {
 		k->rq_tail = rq_tail;
 		ACCESS_ONCE(k->q_ptrs->rq_tail) += i;
+		update_oldest_tsc(k);
+		rq_write_end(k->q_ptrs);
 	}
 
 	return i;
@@ -234,9 +246,9 @@ static void merge_runqueues(struct kthread *l, uint32_t lsize, struct kthread *r
 
 	list_head_init(&r_ths);
 	rsize = drain_threads(r, &r_ths, rsize, true /* update_tail */);
-	update_oldest_tsc(r);
 	spin_unlock(&r->lock);
 
+	rq_write_begin(l->q_ptrs);
 	list_head_init(&l_ths);
 	lsize = drain_threads(l, &l_ths, lsize, false /* update_tail */);
 
@@ -265,6 +277,7 @@ static void merge_runqueues(struct kthread *l, uint32_t lsize, struct kthread *r
 
 	ACCESS_ONCE(l->q_ptrs->rq_head) += rsize;
 	update_oldest_tsc(l);
+	rq_write_end(l->q_ptrs);
 }
 
 static bool steal_work(struct kthread *l, struct kthread *r)
@@ -277,6 +290,14 @@ static bool steal_work(struct kthread *l, struct kthread *r)
 
 	if (!work_available(r, now_tsc) || !spin_try_lock(&r->lock))
 		return rx_poll_locked(r);
+
+	if (unlikely(get_gc_gen() != r->local_gc_gen)) {
+		if (!ACCESS_ONCE(r->parked)) {
+			spin_unlock(&r->lock);
+			return false;
+		}
+		gc_kthread_report(r);
+	}
 
 	/* first try to steal directly from the runqueue */
 	lsize = l->q_ptrs->rq_head - l->q_ptrs->rq_tail;
@@ -349,6 +370,9 @@ static __noinline void schedule(void)
 	ACCESS_ONCE(l->q_ptrs->rcu_gen) = l->rcu_gen;
 	assert((l->rcu_gen & 0x1) == 0x0);
 
+	if (unlikely(get_gc_gen() != l->local_gc_gen))
+		gc_kthread_report(l);
+
 	/* check for pending preemption */
 	if (unlikely(preempt_cede_needed(l))) {
 		l->parked = true;
@@ -378,6 +402,8 @@ static __noinline void schedule(void)
 		goto done;
 
 again:
+	if (unlikely(get_gc_gen() != l->local_gc_gen))
+		gc_kthread_report(l);
 
 	if (unlikely(!mbufq_empty(&l->txpktq_overflow)))
 		net_tx_drain_overflow();
@@ -433,6 +459,7 @@ again:
 done:
 	/* pop off a thread and run it */
 	assert(l->rq_head != l->rq_tail);
+	rq_write_begin(l->q_ptrs);
 	th = l->rq[l->rq_tail++ % RUNTIME_RQ_SIZE];
 	ACCESS_ONCE(l->q_ptrs->rq_tail)++;
 
@@ -441,6 +468,7 @@ done:
 		drain_overflow(l);
 
 	update_oldest_tsc(l);
+	rq_write_end(l->q_ptrs);
 
 	store_release(&th->cur_kthread, kthread_idx(l));
 
@@ -484,6 +512,7 @@ static __always_inline void enter_schedule(thread_t *curth)
 
 	/* slow path: switch from the uthread stack to the runtime stack */
 	if (k->rq_head == k->rq_tail ||
+	    get_gc_gen() != k->local_gc_gen ||
 	    preempt_cede_needed(k) ||
 	    (!disable_watchdog &&
 	     unlikely(now_tsc - k->last_softirq_tsc >
@@ -499,6 +528,7 @@ static __always_inline void enter_schedule(thread_t *curth)
 	perthread_get_stable(last_tsc) = now_tsc;
 
 	/* pop the next runnable thread from the queue */
+	rq_write_begin(k->q_ptrs);
 	k->rq_tail++;
 	ACCESS_ONCE(k->q_ptrs->rq_tail)++;
 
@@ -507,6 +537,7 @@ static __always_inline void enter_schedule(thread_t *curth)
 		drain_overflow(k);
 
 	update_oldest_tsc(k);
+	rq_write_end(k->q_ptrs);
 	store_release(&curth->cur_kthread, NCPU);
 	th->cur_kthread = kthread_idx(k);
 	spin_unlock(&k->lock);
@@ -593,6 +624,7 @@ void thread_ready_locked(thread_t *th)
 
 	assert_preempt_disabled();
 	assert_spin_lock_held(&k->lock);
+	rq_write_begin(k->q_ptrs);
 
 	/* ensure new thread lands after older threads */
 	if (unlikely(!list_empty(&k->rq_overflow)))
@@ -603,6 +635,7 @@ void thread_ready_locked(thread_t *th)
 		assert(k->rq_head - k->rq_tail == RUNTIME_RQ_SIZE);
 		list_add_tail(&k->rq_overflow, &th->link);
 		ACCESS_ONCE(k->q_ptrs->rq_head)++;
+		rq_write_end(k->q_ptrs);
 		STAT(RQ_OVERFLOW)++;
 		return;
 	}
@@ -611,6 +644,7 @@ void thread_ready_locked(thread_t *th)
 	if (k->rq_head - k->rq_tail == 1)
 		ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
 	ACCESS_ONCE(k->q_ptrs->rq_head)++;
+	rq_write_end(k->q_ptrs);
 }
 
 /**
@@ -628,6 +662,7 @@ void thread_ready_head_locked(thread_t *th)
 
 	assert_preempt_disabled();
 	assert_spin_lock_held(&k->lock);
+	rq_write_begin(k->q_ptrs);
 
 	thread_ready_prepare(k, th);
 
@@ -642,6 +677,7 @@ void thread_ready_head_locked(thread_t *th)
 	}
 	ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
 	ACCESS_ONCE(k->q_ptrs->rq_head)++;
+	rq_write_end(k->q_ptrs);
 }
 
 /**
@@ -653,29 +689,11 @@ void thread_ready_head_locked(thread_t *th)
 void thread_ready(thread_t *th)
 {
 	struct kthread *k;
-	uint32_t rq_tail;
 
 	k = getk();
-	thread_ready_prepare(k, th);
-	rq_tail = load_acquire(&k->rq_tail);
-	if (unlikely(k->rq_head - rq_tail >= RUNTIME_RQ_SIZE ||
-	             !list_empty_volatile(&k->rq_overflow))) {
-		assert(k->rq_head - rq_tail <= RUNTIME_RQ_SIZE);
-		spin_lock(&k->lock);
-		list_add_tail(&k->rq_overflow, &th->link);
-		drain_overflow(k);
-		spin_unlock(&k->lock);
-		ACCESS_ONCE(k->q_ptrs->rq_head)++;
-		putk();
-		STAT(RQ_OVERFLOW)++;
-		return;
-	}
-
-	k->rq[k->rq_head % RUNTIME_RQ_SIZE] = th;
-	store_release(&k->rq_head, k->rq_head + 1);
-	if (k->rq_head - load_acquire(&k->rq_tail) == 1)
-		ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
-	ACCESS_ONCE(k->q_ptrs->rq_head)++;
+	spin_lock(&k->lock);
+	thread_ready_locked(th);
+	spin_unlock(&k->lock);
 	putk();
 }
 
@@ -688,23 +706,11 @@ void thread_ready(thread_t *th)
 void thread_ready_head(thread_t *th)
 {
 	struct kthread *k;
-	thread_t *oldestth;
 
 	k = getk();
-	thread_ready_prepare(k, th);
 	spin_lock(&k->lock);
-	if (k->rq_head != k->rq_tail)
-		th->ready_tsc = k->rq[k->rq_tail % RUNTIME_RQ_SIZE]->ready_tsc;
-	oldestth = k->rq[--k->rq_tail % RUNTIME_RQ_SIZE];
-	k->rq[k->rq_tail % RUNTIME_RQ_SIZE] = th;
-	if (unlikely(k->rq_head - k->rq_tail > RUNTIME_RQ_SIZE)) {
-		list_add(&k->rq_overflow, &oldestth->link);
-		k->rq_head--;
-		STAT(RQ_OVERFLOW)++;
-	}
+	thread_ready_head_locked(th);
 	spin_unlock(&k->lock);
-	ACCESS_ONCE(k->q_ptrs->oldest_tsc) = th->ready_tsc;
-	ACCESS_ONCE(k->q_ptrs->rq_head)++;
 	putk();
 }
 
@@ -869,6 +875,7 @@ thread_t *thread_create(thread_fn_t fn, void *arg)
 	th->tf.rdi = (uint64_t)arg;
 	th->tf.rbp = (uint64_t)0; /* just in case base pointers are enabled */
 	th->tf.rip = (uint64_t)fn;
+	gc_register_thread(th);
 	return th;
 }
 
@@ -893,6 +900,7 @@ thread_t *thread_create_with_buf(thread_fn_t fn, void **buf, size_t buf_len)
 	th->tf.rdi = (uint64_t)ptr;
 	th->tf.rbp = (uint64_t)0; /* just in case base pointers are enabled */
 	th->tf.rip = (uint64_t)fn;
+	gc_register_thread(th);
 	*buf = ptr;
 	return th;
 }
@@ -940,6 +948,7 @@ int thread_spawn_main(thread_fn_t fn, void *arg)
 
 void thread_free(thread_t *th)
 {
+	gc_remove_thread(th);
 	stack_free(th->stack);
 	tcache_free(perthread_ptr(thread_pt), th);
 }
@@ -983,8 +992,6 @@ static void schedule_start(void)
 	 * initially). Update RCU generation so it stays even after entering
 	 * schedule().
 	 */
-	if (k->q_ptrs->oldest_tsc == 0)
-		ACCESS_ONCE(k->q_ptrs->oldest_tsc) = UINT64_MAX;
 	ACCESS_ONCE(k->parked) = true;
 	kthread_wait_to_attach();
 	perthread_store(last_tsc, rdtsc());

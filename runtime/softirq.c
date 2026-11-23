@@ -24,6 +24,8 @@ static bool softirq_timer_pending(struct kthread *k, uint64_t now_tsc)
  */
 bool softirq_pending(struct kthread *k, uint64_t now_tsc)
 {
+	if (unlikely(is_world_stopped()))
+		return false;
 	return softirq_iokernel_pending(k) || softirq_timer_pending(k, now_tsc) ||
 	       storage_available_completions(k);
 }
@@ -43,6 +45,9 @@ bool softirq_run_locked(struct kthread *k)
 
 	assert_preempt_disabled();
 	assert_spin_lock_held(&k->lock);
+
+	if (unlikely(is_world_stopped()))
+		return false;
 
 	/* check for iokernel softirq work */
 	if (!k->iokernel_busy && softirq_iokernel_pending(k)) {

@@ -435,6 +435,7 @@ int ioqueues_init_thread(void)
 	myk()->q_ptrs = (struct q_ptrs *) shmptr_to_ptr(r, ts->q_ptrs,
 			sizeof(struct q_ptrs));
 	BUG_ON(!myk()->q_ptrs);
+	myk()->q_ptrs->oldest_tsc = UINT64_MAX;
 
 	return 0;
 }
