@@ -1,0 +1,36 @@
+# Desktop-only unattended matrix; all node settings come from the suite file.
+[matrix]
+suite_config = "suite-client34.toml"
+be_cores = [8, 4, 1]
+application_cores = 33
+same_socket_writer_cpu = 5
+other_socket_writer_cpu = 2
+# Exclude CPU 5 and its SMT sibling 77 in EVERY server configuration.
+server_allowed_cpus = "1,3,7-75,79-143"
+memcached_alone = true
+memcached_stream_dram = true
+memcached_swaptions_gc = true
+logging_off = true
+logging_same_socket = true
+logging_other_socket = true
+repetitions = 9 # Deadline takes precedence. Complete the full breadth before repeating.
+reference_cores = 34
+reference_passing_rps = 7680000
+load_fraction = 0.90
+calibration_attempts = 4
+calibration_backoff = 0.90
+calibration_warmup_seconds = 5
+calibration_measurement_seconds = 20
+maximum_baseline_p99_9_us = 50
+warmup_seconds = 10
+measurement_seconds = 60
+capture_seconds = 180
+stream_bytes_per_worker = 268435456
+# Approximately 10x the working set in the successful 20,000-swaption smoke.
+swaptions = 200000
+simulations = 400
+stop_new_trials = "2026-11-22T22:50:00-05:00"
+reservation_end = "2026-11-22T23:00:00-05:00"
+maximum_trial_seconds = 540
+infrastructure_retries = 1
+random_seed = 42

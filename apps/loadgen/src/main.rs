@@ -583,21 +583,9 @@ fn process_result_final(
     let first_tsc = results.iter().filter_map(|res| res.first_tsc).min();
     let start_unix = wct_start + sched_start;
 
-    // Count stream-full events as drops.
-    let sent_count = response_count + drop_count + full_stream_count;
-
-    // TODO: better handling of this case.
-    if response_count <= 1 {
-        println!(
-            "{}, {}, 0, {}, {}, {}",
-            sched.service.name(),
-            sched.rps,
-            drop_count + full_stream_count,
-            sched_miss_count,
-            start_unix.duration_since(UNIX_EPOCH).unwrap().as_secs()
-        );
-        return false;
-    }
+    // Failed enqueues are attempted requests, not transmitted requests.
+    let sent_count = response_count + drop_count;
+    let attempted_count = sent_count + full_stream_count;
 
     results.iter().for_each(|res| {
         for (k, v) in &res.latencies {
@@ -606,7 +594,10 @@ fn process_result_final(
     });
 
     let percentile = |p| {
-        let idx = (sent_count as f32 * p / 100.0) as usize;
+        if response_count <= 1 {
+            return INFINITY;
+        }
+        let idx = (attempted_count as f32 * p / 100.0) as usize;
         if idx >= response_count {
             return INFINITY;
         }
@@ -621,9 +612,9 @@ fn process_result_final(
         return INFINITY;
     };
 
-    let last_send = last_send.unwrap();
-    let first_send = first_send.unwrap();
-    let first_tsc = first_tsc.unwrap();
+    let first_send = first_send.unwrap_or(sched_start);
+    let last_send = last_send.unwrap_or(first_send + sched.runtime);
+    let first_tsc = first_tsc.unwrap_or(0);
     let start_unix = wct_start + first_send;
 
     if let OutputMode::Live = sched.output {
@@ -634,14 +625,14 @@ fn process_result_final(
             percentile(99.0) as usize,
             percentile(99.9) as usize
         );
-        return true;
+        return response_count > 1;
     }
     let rt_stat_values = rt_stats.map_or_else(
         || String::new(),
         |(map1, map0)| format!(", {}", get_rt_stat_values(&map1, &map0).join(", ")),
     );
 
-    let schedule_adherance = 100.0 * sent_count as f64 / (sent_count + sched_miss_count) as f64;
+    let schedule_adherance = 100.0 * attempted_count as f64 / (attempted_count + sched_miss_count).max(1) as f64;
 
     let elapsed = last_send - first_send;
     let elapsed_micros = elapsed.as_micros();
@@ -667,7 +658,7 @@ fn process_result_final(
         percentile(99.0),
         percentile(99.9),
         percentile(99.99),
-        *buckets.keys().max().unwrap() as f32,
+        buckets.keys().max().map_or(INFINITY, |v| *v as f32),
         start_unix.duration_since(UNIX_EPOCH).unwrap().as_secs(),
         first_tsc,
         rt_stat_values
@@ -727,7 +718,7 @@ fn process_result_final(
         });
     }
 
-    true
+    response_count > 1
 }
 
 fn process_result(sched: &RequestSchedule, packets: &mut [Packet]) -> Option<ScheduleResult> {
@@ -762,10 +753,6 @@ fn process_result(sched: &RequestSchedule, packets: &mut [Packet]) -> Option<Sch
                 }
             }
         }
-    }
-
-    if packets.len() - dropped - sched_miss - full_stream <= 1 {
-        return None;
     }
 
     let first_send = packets.iter().filter_map(|p| p.actual_start).min();
@@ -989,6 +976,7 @@ fn run_client_worker(
     wg.follower_notify().follower_wait();
     let start = Instant::now();
     let mut sched_idx = 0;
+    let mut no_tx_buffers = 0usize;
 
     stat_conn.trigger_stat()?;
 
@@ -1014,8 +1002,12 @@ fn run_client_worker(
 
         if let Err(e) = (&*socket).nonpartial_write(&payload[..], true) {
             match e.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::ENOSPC) => {
-                    // Mark packet as dropped due to stream being full by setting completion_time = actual_start
+                Some(libc::EAGAIN) | Some(libc::ENOSPC) | Some(libc::ENOBUFS) => {
+                    if e.raw_os_error() == Some(libc::ENOBUFS) {
+                        no_tx_buffers += 1;
+                    }
+                    // Do not retry: preserve the open-loop offered request schedule.
+                    // Equal timestamps identify a request that was not enqueued.
                     packet.completion_time = packet.actual_start;
                     continue;
                 }
@@ -1030,6 +1022,9 @@ fn run_client_worker(
         }
     }
 
+    if no_tx_buffers > 0 {
+        eprintln!("Client TX buffer exhaustion: {} requests not enqueued (connection {})", no_tx_buffers, index);
+    }
     stat_conn.trigger_stat()?;
 
     wg.follower_notify().follower_wait();
@@ -2177,4 +2172,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+
+    fn schedule() -> RequestSchedule {
+        RequestSchedule { arrival: Distribution::Zero, service: Distribution::Zero,
+            output: OutputMode::Normal, runtime: Duration::from_secs(1), rps: 1000,
+            discard_pct: 0.0 }
+    }
+
+    fn packet(start: Option<u64>, end: Option<u64>) -> Packet {
+        Packet { work_iterations: 0, randomness: 0, target_start: Duration::ZERO,
+            actual_start: start.map(Duration::from_micros),
+            completion_time: end.map(Duration::from_micros),
+            completion_time_ns: Arc::new(AtomicU64::new(0)),
+            completion_server_tsc: if end.is_some() && start != end { Some(123) } else { None } }
+    }
+
+    #[test]
+    fn connections_without_responses_keep_their_failure_counts() {
+        let mut packets = vec![packet(None,None),packet(Some(10),Some(10)),packet(Some(20),None)];
+        let result = process_result(&schedule(), &mut packets).unwrap();
+        assert_eq!(result.response_count,0);
+        assert_eq!(result.sched_miss_count,1);
+        assert_eq!(result.full_stream_count,1);
+        assert_eq!(result.drop_count,1);
+        assert!(result.latencies.is_empty());
+        // Even a complete lack of responses emits the normal summary without panicking.
+        assert!(!process_result_final(&schedule(),vec![result],UNIX_EPOCH,Duration::ZERO,None));
+    }
+
+    #[test]
+    fn all_missed_requests_do_not_require_send_times_or_server_timestamps() {
+        let mut packets = vec![packet(None,None),packet(None,None)];
+        let result = process_result(&schedule(), &mut packets).unwrap();
+        assert_eq!(result.sched_miss_count,2);
+        assert!(!process_result_final(&schedule(),vec![result],UNIX_EPOCH,Duration::ZERO,None));
+    }
+
+    #[test]
+    fn failed_connection_and_successful_connection_can_be_aggregated() {
+        let mut missed = vec![packet(None,None),packet(None,None)];
+        let mut completed = vec![packet(Some(10),Some(15)),packet(Some(20),Some(27))];
+        let bad = process_result(&schedule(), &mut missed).unwrap();
+        let good = process_result(&schedule(), &mut completed).unwrap();
+        assert_eq!(good.response_count,2);
+        assert_eq!(good.latencies.get(&5),Some(&1));
+        process_result_final(&schedule(),vec![bad,good],UNIX_EPOCH,Duration::ZERO,None);
+    }
 }

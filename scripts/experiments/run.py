@@ -104,6 +104,8 @@ def validate_config(c):
     if not any(c['conditions'].values()) or not any((c['logging']['run_with_logging'],
                                                   c['logging']['run_without_logging'])):
         raise ValueError('Enable at least one condition and logging mode')
+    if c['logging'].get('queue_snapshot_failures', False) and c['logging']['run_without_logging']:
+        raise ValueError('queue_snapshot_failures requires binary logging on for every run')
     for role in ('memcached', 'antagonist'):
         if c['allocation'][role + '_guaranteed'] > c['allocation'][role + '_cores']:
             raise ValueError(role + ' guaranteed cores exceed maximum cores')
@@ -191,6 +193,8 @@ def runtime_config(c, role):
 
 def iokernel_command(c, node, root, server, logging):
     argv = [node['repo'] + '/iokerneld', 'ias', 'numanode', str(node['numa_node']), 'nicpci', node['nic_pci']]
+    if server and logging and c['logging'].get('queue_snapshot_failures', False):
+        argv += ['queue_snapshot_failure_logging', 'on']
     if not c['allocation']['use_smt']:
         argv.append('noht')
     if node['allowed_cpus']:
@@ -271,7 +275,11 @@ class Node:
     def bootstrap(self):
         code = ('import base64,pathlib; p=pathlib.Path(%r); p.parent.mkdir(parents=True,exist_ok=True); '
                 'p.write_bytes(base64.b64decode(%r))') % (self.helper, base64.b64encode(REMOTE.read_bytes()).decode())
-        subprocess.run(self.ssh + [shlex.join(['python3', '-c', code])], check=True, timeout=40)
+        result = subprocess.run(self.ssh + [shlex.join(['python3', '-c', code])],
+                                capture_output=True, text=True, timeout=40)
+        if result.returncode:
+            raise RuntimeError('%s bootstrap failed: %s' %
+                               (self.config['host'], result.stderr.strip() or result.stdout.strip()))
         self.rpc('init')
         self.initialized = True
 
@@ -309,15 +317,17 @@ class Node:
             time.sleep(2)
         raise TimeoutError(label + ' exceeded launcher timeout')
 
-    def collect(self, destination):
+    def collect(self, destination, compress=False):
         expected = self.rpc('manifest')
         destination.mkdir(parents=True, exist_ok=True)
         if shutil.disk_usage(destination).free < sum(v['size'] for v in expected.values()):
             raise RuntimeError('Not enough local disk space to collect remote results')
-        proc = subprocess.Popen(self.ssh + [shlex.join(['tar', '-C', self.root, '-cf', '-', '.'])],
+        command = (['taskset', '-c', '0,72', 'tar', '-I', 'gzip -1', '-C', self.root, '-cf', '-', '.']
+                   if compress else ['tar', '-C', self.root, '-cf', '-', '.'])
+        proc = subprocess.Popen(self.ssh + [shlex.join(command)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            with tarfile.open(fileobj=proc.stdout, mode='r|') as archive:
+            with tarfile.open(fileobj=proc.stdout, mode='r|*') as archive:
                 for member in archive:
                     target = (destination / member.name).resolve()
                     if not target.is_relative_to(destination.resolve()):
@@ -424,6 +434,21 @@ def recover_previous(c, suite_dir, run_dir):
         node.rpc('stop')
         node.collect(attempt_dir / role)
         node.rpc('release')
+
+
+def queue_snapshot_frequency(directory, first_tsc, duration):
+    source = REPO / 'scripts/telemetry_capture_stats.cc'
+    binary = RESULTS / '.analysis-tools' / ('snapshot-' + hashlib.sha256(source.read_bytes()).hexdigest()[:16])
+    if not binary.exists():
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(['g++', '-std=c++17', '-O3', str(source), '-o', str(binary)], check=True)
+    output = subprocess.run([str(binary), '--snapshot-frequency', str(directory / 'capture'),
+                             str(first_tsc), str(duration)], check=True, capture_output=True, text=True)
+    result = json.loads(output.stdout)
+    if not result:
+        raise RuntimeError('No queue observations inside measured window')
+    save(directory / 'queue-snapshot-frequency.json', result)
+    return result
 
 
 def batch_throughput(directory, first_tsc, duration):
@@ -623,6 +648,17 @@ def run_one(c, suite_dir, run, warmup=None, duration=None):
             record['summary'] = {k: v if math.isfinite(v) else None for k, v in row.items()}
             issues = quality(row, run['rps'], c['validation'])
             record['validation_issues'] = issues
+            if c['logging'].get('queue_snapshot_failures', False):
+                record['queue_snapshot_frequency'] = queue_snapshot_frequency(
+                    attempt / 'server', row['first_server_tsc'], duration)
+                for label, name in (('memcached', 'lc'), ('antagonist', 'be')):
+                    path = attempt / 'server' / (label + '.log')
+                    if not path.exists():
+                        continue
+                    match = re.search(r'process pid:\s*(\d+)', path.read_text())
+                    if match and match.group(1) in record['queue_snapshot_frequency']:
+                        record['summary'][name + '_snapshot_rejection_percent'] = (
+                            record['queue_snapshot_frequency'][match.group(1)]['rejection_percent'])
             if run['condition'] != 'memcached_alone' and c['batch_monitor']['enabled']:
                 record['summary']['be_operations_per_second'] = batch_throughput(
                     attempt / 'server', row['first_server_tsc'], duration)
@@ -695,7 +731,8 @@ def report(suite_dir, c):
             records.append(value)
     with (suite_dir / 'summary.csv').open('w', newline='') as output:
         fields = ['run', 'condition', 'fraction', 'repetition', 'logging', 'state', 'sent_rps',
-                  'response_rps', 'p99_us', 'p99_9_us', 'drops', 'be_operations_per_second']
+                  'response_rps', 'p99_us', 'p99_9_us', 'drops', 'be_operations_per_second',
+                  'lc_snapshot_rejection_percent', 'be_snapshot_rejection_percent']
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
         for value in records:
@@ -817,6 +854,10 @@ def main():
             say(str(exc))
             if not c['suite']['continue_after_failure']:
                 raise
+            failed = json.loads(latest.read_text()) if latest.exists() else {}
+            if (not failed.get('summary') or
+                    any(not e.startswith('Validation:') for e in failed.get('errors', []))):
+                raise RuntimeError('Infrastructure failure; refusing to advance suite') from exc
         finally:
             report(suite_dir, c)
     say('Suite complete: ' + str(suite_dir / 'summary.csv'))

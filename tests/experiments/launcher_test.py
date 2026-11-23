@@ -29,6 +29,17 @@ class LauncherTest(unittest.TestCase):
     def setUp(self):
         self.config = launcher.load_config(launcher.TEMPLATE)
 
+    def test_sequence_toggle_requires_binary_logging(self):
+        c = self.config
+        c['logging']['queue_snapshot_failures'] = True
+        command = launcher.iokernel_command(c, c['nodes']['server'], '/tmp/run', True, True)
+        self.assertIn('queue_snapshot_failure_logging', command)
+        command = launcher.iokernel_command(c, c['nodes']['server'], '/tmp/run', True, False)
+        self.assertNotIn('queue_snapshot_failure_logging', command)
+        c['logging']['run_without_logging'] = True
+        with self.assertRaisesRegex(ValueError, 'requires binary logging'):
+            launcher.validate_config(c)
+
     def test_strict_config(self):
         with self.assertRaisesRegex(ValueError, 'unknown keys'):
             launcher.merge(self.config, {'conditions': {'memcached_alnoe': True}})

@@ -1,0 +1,12 @@
+--- a/config/gcc-shenango-gc.bldconf
++++ b/config/gcc-shenango-gc.bldconf
+@@ -9,7 +9,7 @@
+     exit 1
+ fi
+ 
+-SHEN_LIBS_CXX="${SHEN_LIBS_CXX} ${GCDIR}/lib/libgc.a"
+-SHEN_LIBS="${SHEN_LIBS} ${GCDIR}/lib/libgc.a"
++SHEN_LIBS_CXX="-Wl,--start-group ${SHEN_LIBS_CXX} ${GCDIR}/lib/libgc.a -Wl,--end-group"
++SHEN_LIBS="-Wl,--start-group ${SHEN_LIBS} ${GCDIR}/lib/libgc.a -Wl,--end-group"
+ SHEN_CFLAGS="${SHEN_CFLAGS} -DSHEN_GC -I${GCDIR}/include/"
+ SHEN_CXXFLAGS="${SHEN_CXXFLAGS} -DSHEN_GC -I${GCDIR}/include/"

@@ -56,6 +56,22 @@ class SearchTest(unittest.TestCase):
         trials = [self.trial(10000) for _ in range(3)] + [self.trial(10500, send_fraction=.5)]
         self.assertEqual(search.target_result(trials, 50, self.settings)['status'], 'client_limited')
 
+    def test_backpressure_is_distinct_from_client_cpu_limit(self):
+        summary = sample(20000, send_fraction=.5)
+        summary['send_backpressure'] = True
+        self.assertEqual(search.classify(summary,20000,50,self.settings),'backpressure')
+        summary['schedule_adherence_percent'] = 90
+        self.assertEqual(search.classify(summary,20000,50,self.settings),'client_limited')
+
+    def test_backpressure_bracket_is_qualified(self):
+        trials = [self.trial(10000) for _ in range(3)]
+        bad = self.trial(10500,send_fraction=.5)
+        bad['summary']['send_backpressure'] = True
+        trials.append(bad)
+        result = search.target_result(trials,50,self.settings)
+        self.assertEqual(result['status'],'backpressure_limited')
+        self.assertEqual(result['upper_kind'],'backpressure')
+
     def test_mixed_results_are_not_confirmed(self):
         trials = [self.trial(10000), self.trial(10000, latency=60)]
         result = search.target_result(trials, 50, self.settings)

@@ -26,6 +26,9 @@ def client_ok(summary, rate, settings):
 
 def classify(summary, rate, target, settings):
     if not client_ok(summary, rate, settings):
+        if (summary.get('send_backpressure', False) and
+                summary['schedule_adherence_percent'] >= settings['minimum_schedule_adherence_percent']):
+            return 'backpressure'
         return 'client_limited'
     latency = summary.get('p99_9_us')
     if (latency is None or not math.isfinite(latency) or latency >= target or
@@ -42,7 +45,8 @@ def groups(trials, target, settings):
     result = {}
     for rate, outcomes in rates.items():
         # A mixed outcome is not a confirmed passing rate.
-        outcome = 'fail' if 'fail' in outcomes else 'client_limited' if 'client_limited' in outcomes else 'pass'
+        outcome = ('fail' if 'fail' in outcomes else 'backpressure' if 'backpressure' in outcomes
+                   else 'client_limited' if 'client_limited' in outcomes else 'pass')
         result[rate] = dict(outcome=outcome, passes=outcomes.count('pass'), observations=len(outcomes),
                             inconsistent=len(set(outcomes)) > 1)
     return result
@@ -58,7 +62,8 @@ def target_result(trials, target, settings):
     status = 'searching'
     if low is not None and confirmed:
         if high is not None and (high - low) / low <= settings['relative_precision']:
-            status = 'bracketed' if rates[high]['outcome'] == 'fail' else 'client_limited'
+            status = {'fail': 'bracketed', 'backpressure': 'backpressure_limited',
+                      'client_limited': 'client_limited'}[rates[high]['outcome']]
         elif low == settings['maximum_rps']:
             status = 'search_ceiling_reached'
     return dict(p99_9_target_us=target, highest_passing_rps=low, upper_rps=high,
@@ -194,6 +199,12 @@ def execute_pending(root, state, base, settings):
                         raise
                     launcher.say('Retrying infrastructure failure: ' + run['id'])
                     continue
+        log_path = root / run['id'] / record.get('attempt', '') / 'client/loadgen.log'
+        if not log_path.exists():
+            attempts = sorted((root / run['id']).glob('attempt-*/client/loadgen.log'))
+            log_path = attempts[-1] if attempts else log_path
+        if log_path.exists():
+            record['summary']['send_backpressure'] = 'TCP send buffer was full' in log_path.read_text()
         trial = dict(cores=pending['cores'], rps=pending['rps'], phase=pending['phase'],
                      summary=record['summary'], source=str(latest_path))
         state['trials'].append(trial)

@@ -133,6 +133,12 @@ if $gc; then
             --enable-threads=shenango --enable-shared=no --with-shenango="$repo"
         make -j"$jobs" install
     )
+    for compatibility_patch in "$repo"/build/patches/swaptions/*.patch; do
+        if ! git -C "$artifact/parsec" apply --reverse --check "$compatibility_patch" 2>/dev/null; then
+            git -C "$artifact/parsec" apply --check "$compatibility_patch"
+            git -C "$artifact/parsec" apply "$compatibility_patch"
+        fi
+    done
     export GCDIR="$artifact/gc/build"
     "$artifact/parsec/bin/parsecmgmt" -a build -p swaptions -c gcc-shenango-gc
 fi

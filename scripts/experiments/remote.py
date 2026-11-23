@@ -238,6 +238,15 @@ def main(action, request):
             if all('returncode' in json.loads(p.read_text()) for p in root.glob('*.job.status.json')):
                 break
             time.sleep(.1)
+        # ENOSPC can prevent a supervisor from recording its exit. Recover
+        # only when the original process identity no longer exists.
+        for path in root.glob('*.job.status.json'):
+            state = json.loads(path.read_text())
+            if ('returncode' not in state and state.get('pid') and
+                    proc_start(state['pid']) != state.get('proc_start')):
+                state.update(returncode=125, finished_unix=time.time(),
+                             recovered_missing_exit_status=True)
+                save(path, state)
         owned = root / 'ipc-owned.json'
         if owned.exists():
             ipc = json.loads(owned.read_text())
@@ -261,10 +270,28 @@ def main(action, request):
                 return {'complete': False}
             flags = struct.unpack_from('<I', header, 52)[0]
             records[path.name] = {'complete': flags == 1, 'size': path.stat().st_size}
-        return {'complete': len(records) == 7 and all(v['complete'] for v in records.values()),
+        required = {'capture.' + suffix + '.bin' for suffix in
+                    ('bw', 'llc', 'pmc-failure', 'sched', 'queue', 'task', 'delay')}
+        return {'complete': required.issubset(records) and all(v['complete'] for v in records.values()),
                 'streams': records}
     if action == 'manifest':
         return manifest(root)
+    if action == 'prune-captures':
+        # Caller has verified local copies against the transfer manifest. Only
+        # remove captures from this owned run after all its writers have stopped.
+        if any('returncode' not in json.loads(p.read_text())
+               for p in root.glob('*.job.status.json')):
+            raise RuntimeError('Refusing to prune captures from a live run')
+        removed = []
+        for name, metadata in request['verified'].items():
+            path = root / name
+            if path.parent != root or not name.startswith('capture.') or not name.endswith('.bin'):
+                continue
+            if path.is_symlink() or path.stat().st_size != metadata['size']:
+                raise RuntimeError('Capture changed after transfer: ' + name)
+            path.unlink()
+            removed.append(name)
+        return removed
     if action == 'release':
         # Delete only the lock. Remote result files are intentionally retained.
         lock.unlink()

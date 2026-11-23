@@ -69,7 +69,7 @@ memcached_guaranteed = 4
 antagonist_cores = 4
 antagonist_guaranteed = 4 # Must be nonzero when core_allocation is false.
 client_cores = 4
-writer_cpu = 5 # Always reserved, including logging-off/calibration runs.
+writer_cpu = 2 # Always reserved, including logging-off/calibration runs.
 
 [interventions]
 bandwidth = false
@@ -83,6 +83,7 @@ memcached_stream_dram = false
 memcached_swaptions_gc = false
 
 [logging]
+queue_snapshot_failures = false # Binary record per rejected read; requires run_with_logging.
 run_without_logging = true
 run_with_logging = true
 # Telemetry begins at IOKernel startup, before preload. It has no early-stop API.
