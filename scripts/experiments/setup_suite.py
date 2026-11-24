@@ -31,7 +31,7 @@ def steps(c, role):
         result.append(('build-loadgen', ['bash', scripts + 'build-loadgen.sh']))
     if role == 'server':
         workloads = [('build_memcached', '--memcached'), ('build_stream_dram', '--stream-dram'),
-                     ('build_swaptions_gc', '--swaptions-gc')]
+                     ('build_swaptions_gc', '--swaptions-gc'), ('build_x264', '--x264')]
         selected = [flag for key, flag in workloads if settings[key]]
         if selected:
             argv = ['bash', scripts + 'build-workloads.sh', '--artifact', node['artifact'],

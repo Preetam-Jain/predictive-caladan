@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
     cat <<'USAGE'
 Usage: build-workloads.sh --artifact /absolute/path [--revision SHA] [--repository URL]
-       [--jobs N] [--install-deps] [--memcached] [--stream-dram] [--swaptions-gc]
+       [--jobs N] [--install-deps] [--memcached] [--stream-dram] [--swaptions-gc] [--x264]
 
 Clone the artifact only if absent; otherwise require the requested revision.
 Never forces a checkout, cleans a tree, or substitutes the artifact's older runtime.
@@ -18,6 +18,7 @@ install_deps=false
 memcached=false
 stream=false
 gc=false
+x264=false
 while (($#)); do
     case "$1" in
         --help|-h) usage; exit 0 ;;
@@ -34,6 +35,7 @@ while (($#)); do
         --memcached) memcached=true; shift ;;
         --stream-dram) stream=true; shift ;;
         --swaptions-gc) gc=true; shift ;;
+        --x264) x264=true; shift ;;
         *) usage >&2; exit 2 ;;
     esac
 done
@@ -69,8 +71,9 @@ as_root() {
 if $install_deps; then
     as_root apt-get update
     as_root apt-get install -y autoconf automake libtool libevent-dev libatomic-ops-dev
+    if $x264; then as_root apt-get install -y yasm; fi
 fi
-if $memcached || $gc; then
+if $memcached || $gc || $x264; then
     if [[ ! -e $artifact ]]; then
         git clone --no-checkout "$repository" "$artifact"
         git -C "$artifact" checkout --detach "${revision:-HEAD}"
@@ -82,7 +85,8 @@ if $memcached || $gc; then
     fi
     modules=()
     if $memcached; then modules+=(memcached); fi
-    if $gc; then modules+=(gc parsec); fi
+    if $gc; then modules+=(gc); fi
+    if $gc || $x264; then modules+=(parsec); fi
     git -C "$artifact" submodule update --init --recursive -- "${modules[@]}"
 fi
 # Application builds can otherwise reuse objects linked against an older runtime.
@@ -142,5 +146,26 @@ if $gc; then
     export GCDIR="$artifact/gc/build"
     "$artifact/parsec/bin/parsecmgmt" -a build -p swaptions -c gcc-shenango-gc
 fi
-if $memcached || $gc; then printf '%s\n' "$identity_hash" > "$artifact/.caladan-workload-runtime"; fi
+if $x264; then
+    for compatibility_patch in "$repo"/build/patches/x264/*.patch; do
+        if ! git -C "$artifact/parsec" apply --reverse --check "$compatibility_patch" 2>/dev/null; then
+            git -C "$artifact/parsec" apply --check "$compatibility_patch"
+            git -C "$artifact/parsec" apply "$compatibility_patch"
+        fi
+    done
+    (
+        cd "$artifact/parsec/pkgs/apps/x264/src"
+        runtime_libs=$(make -s -f "$repo/Makefile" print-RUNTIME_LIBS ROOT_PATH="$repo" |
+            sed -n 's/^RUNTIME_LIBS = //p')
+        [[ -n $runtime_libs ]]
+        ./configure --prefix="$artifact/x264" --enable-pthread \
+            --extra-cflags="-DSHENANGO -I$repo/inc -fcommon" \
+            --extra-ldflags="-no-pie -T $repo/base/base.ld -Wl,--wrap=main $repo/shim/libshim.a -ldl $runtime_libs"
+        make -j"$jobs" RANLIB=ranlib
+        make install RANLIB=ranlib
+        mkdir -p "$artifact/x264/input"
+        tar -xf ../inputs/input_simdev.tar -C "$artifact/x264/input"
+    )
+fi
+if $memcached || $gc || $x264; then printf '%s\n' "$identity_hash" > "$artifact/.caladan-workload-runtime"; fi
 printf 'Requested workloads built against %s. Log: %s\n' "$repo" "$log"

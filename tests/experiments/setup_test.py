@@ -77,6 +77,7 @@ class SetupTest(unittest.TestCase):
         self.assertLess(names.index('configure-machine'), names.index('verify-machine'))
         argv = dict(stages)['build-workloads']
         self.assertIn('--swaptions-gc', argv)
+        self.assertIn('--x264', argv)
         self.assertIn(self.config['nodes']['server']['artifact'], argv)
         self.assertNotIn('build-workloads', dict(setup.steps(self.config, 'client')))
 
