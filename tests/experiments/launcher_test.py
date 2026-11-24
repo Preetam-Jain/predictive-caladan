@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -235,6 +236,113 @@ print('zero, %d, %d, 0, 100, 1, 2, 3, 4, 5, 6, 10, 1700000000, 1000' % (rate,rat
             self.assertIn('simulated client failure', (failed_dir / 'client/loadgen.log').read_text())
             self.assertTrue((failed_dir / 'server/transfer-manifest.json').exists())
             self.assertEqual(json.loads((failed_dir / 'run.json').read_text())['state'], 'failed')
+            self.assertFalse((root / 'server/results/.launcher-lock.json').exists())
+
+    def test_packet_log_compression_verification_and_prune(self):
+        if not shutil.which('zstd'):
+            self.skipTest('zstd not installed')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / 'tools'
+            tools.mkdir()
+            numactl = tools / 'numactl'
+            numactl.write_text('#!/bin/sh\nshift\nshift\nexec "$@"\n')
+            numactl.chmod(0o755)
+            ssh = tools / 'ssh'
+            ssh.write_text('#!/usr/bin/env python3\nimport os,sys\nos.execvp("sh",["sh","-c",sys.argv[-1]])\n')
+            ssh.chmod(0o755)
+            c = launcher.load_config(launcher.TEMPLATE)
+            c['logging'].update(capture_seconds=6, finalize_timeout_seconds=10)
+            c['suite'].update(warmup_seconds=0, measurement_seconds=2, client_timeout_seconds=30,
+                              startup_timeout_seconds=15, minimum_free_gb=1)
+            c['memcached']['client_connections'] = 2
+            c['network']['directpath'] = True
+            c['pktlog'].update(enabled=True, node=0)
+            c['nodes']['server']['numa_node'] = 1
+            c['storage'].update(compress=True, zstd_level=3, verify_raw=True, prune_remote=True)
+            c['schedule']['load_steps'] = [0.5, 1.0]
+            launcher.validate_config(c)
+            fake_iokernel = r'''#!/usr/bin/env python3
+import os,sys,time,struct
+print('main: core 0 running dataplane.',flush=True)
+if 'telemetry' in sys.argv:
+ i=sys.argv.index('telemetry'); prefix=sys.argv[i+2]; seconds=int(sys.argv[i+3])
+ if prefix != '-':
+  layouts=[('bw',16),('llc',64),('pmc-failure',24),('sched',24),('queue',64),('task',40),('delay',56)]
+  def header(size,kind,complete,n):
+   return struct.pack('<8sIIIIdQIIIIdQQ16s',b'CALATLM\0',8,96,size,kind,1000.,0,4,0,0,complete,1.,n,0,b'x'*16)
+  time.sleep(seconds)
+  for kind,(suffix,size) in enumerate(layouts,1):
+   open(prefix+'.'+suffix+'.bin','wb').write(header(size,kind,1,1000)+os.urandom(16)*(size*1000//16))
+  print('telemetry: all streams drained and closed',flush=True)
+while True: time.sleep(1)
+'''
+            fake_iokernel = fake_iokernel.replace("b'CALATLM\\\\0'", "b'CALATLM\\0'")
+            fake_client = '''#!/usr/bin/env python3
+import sys
+args=sys.argv
+steps=[e for e in args[args.index('--loadshift')+1].split(',') if not e.endswith(':silent')]
+if '--trace-prefix' in args:
+ prefix=args[args.index('--trace-prefix')+1]
+ for i in range(int(args[args.index('--conns')+1])):
+  open('%s.c%03d.s%03d.bin' % (prefix,i,i),'wb').write(b'CALCTRC' + bytes(57 + 48*500))
+for step in steps:
+ rate=int(step.split(':')[0])
+ print('zero, %d, %d, 0, 100, 1, 2, 3, 4, 5, 6, 10, 1700000000, 1000' % (rate,rate),flush=True)
+'''
+            # pktlogctl stand-in: stat says empty; dump writes one per-kthread file.
+            fake_ctl = '''#!/usr/bin/env python3
+import json,sys
+cmd=sys.argv[1]; args=sys.argv
+if cmd=='stat':
+ print(json.dumps(dict(ok=True,empty=True,in_use=False)))
+elif cmd=='dump':
+ out=args[args.index('--out')+1]
+ open(out+'.pkt.k000.bin','wb').write(b'CALPKTD\\0'+bytes(88+32*1000))
+ print(json.dumps(dict(ok=True,records=1000,dropped=0,exhausted=False,file_count=1,generation=1)))
+elif cmd=='reset':
+ print(json.dumps(dict(ok=True,empty=True)))
+elif cmd=='now':
+ print(json.dumps(dict(ok=True,tsc_before=1,tsc_after=2)))
+'''
+            for role in ('server', 'client'):
+                repo = root / role / 'repo'
+                artifact = root / role / 'artifact'
+                (repo / 'apps/loadgen/target/release').mkdir(parents=True)
+                (repo / 'scripts/pktlog').mkdir(parents=True)
+                (artifact / 'memcached').mkdir(parents=True)
+                for path, content in ((repo / 'iokerneld', fake_iokernel),
+                                      (repo / 'apps/loadgen/target/release/loadgen', fake_client),
+                                      (repo / 'scripts/pktlog/pktlogctl', fake_ctl),
+                                      (artifact / 'memcached/memcached', '#!/usr/bin/env python3\nimport time\nwhile True: time.sleep(1)\n')):
+                    path.write_text(content)
+                    path.chmod(0o755)
+                c['nodes'][role].update(host=role, user='test', repo=str(repo), artifact=str(artifact),
+                                         remote_results=str(root / role / 'results'), sudo=False)
+            suite = root / 'suite'
+            suite.mkdir()
+            run = dict(id='pkt', condition='memcached_alone', logging=True, rps=1000, fraction=.5, repetition=1)
+            with patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH']):
+                record = launcher.run_one(c, suite, run)
+            self.assertEqual(record['state'], 'complete', record.get('errors'))
+            attempt = suite / 'pkt/attempt-001'
+            self.assertEqual(record['pktlog'], dict(records=1000, files=1, client_traces=2))
+            self.assertEqual([s['rps'] for s in record['summary']['steps']], [500, 1000])
+            self.assertIn('pktlog_path ' + c['pktlog']['segment_path'],
+                          (attempt / 'server/memcached.config').read_text())
+            # Only compressed copies arrive, each verified against the node's raw hash.
+            for role, names in (('server', ['capture.bw.bin', 'pktlog.pkt.k000.bin']),
+                                ('client', ['ctrace.c000.s000.bin', 'ctrace.c001.s001.bin'])):
+                manifest = json.loads((attempt / role / 'compression-manifest.json').read_text())
+                verified = json.loads((attempt / role / 'raw-verification.json').read_text())
+                for name in names:
+                    self.assertFalse((attempt / role / name).exists())
+                    self.assertTrue((attempt / role / (name + '.zst')).exists())
+                    self.assertEqual(verified[name]['sha256'], manifest[name]['raw_sha256'])
+                # Nothing verified is left on the node.
+                remote_files = [p for p in (root / role / 'results').rglob('*')
+                                if p.is_file() and 'experiment-remote' not in p.name]
+                self.assertEqual(remote_files, [])
             self.assertFalse((root / 'server/results/.launcher-lock.json').exists())
 
 

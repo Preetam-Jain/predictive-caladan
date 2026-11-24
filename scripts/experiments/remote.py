@@ -296,7 +296,133 @@ def main(action, request):
         # Delete only the lock. Remote result files are intentionally retained.
         lock.unlink()
         return True
+    if action == 'pktlog-setup':
+        # Reserve hugepages on the segment node if needed and create the segment
+        # once per machine session; an existing segment is only checked.
+        argv = ['bash', request['repo'] + '/scripts/cloudlab/pktlog-setup.sh', '--path', request['path'],
+                '--gib', str(request['gib']), '--node', str(request['node']),
+                '--ctl', request['ctl']]
+        return run_json(argv, request['sudo'], timeout=1800)
+    if action == 'pktlog-stat':
+        return run_json([request['ctl'], 'stat', '--path', request['path']], request['sudo'])
+    if action == 'pktlog-dump':
+        # Writes ROOT/pktlog.pkt.kNNN.bin, then empties the segment. The reset
+        # happens only after a successful, fsynced dump; on any failure the
+        # segment keeps its records and the next run's preflight refuses to start.
+        if any('returncode' not in json.loads(p.read_text()) for p in root.glob('*.job.status.json')):
+            raise RuntimeError('Refusing to dump the packet log while run processes are alive')
+        argv = [request['ctl'], 'dump', '--path', request['path'], '--out', str(root / 'pktlog')]
+        capture = root / 'capture.bw.bin'
+        if capture.exists():
+            argv += ['--experiment-id-from', str(capture)]
+        dump = run_json(argv, request['sudo'], timeout=3600)
+        save(root / 'pktlog-dump.json', dump)
+        reset = run_json([request['ctl'], 'reset', '--path', request['path']], request['sudo'], timeout=600)
+        save(root / 'pktlog-reset.json', reset)
+        return dict(dump=dump, reset=reset)
+    if action == 'clock':
+        # TSC and wall clock of this node, for stamping scheduled events.
+        return run_json([request['ctl'], 'now'], False)
+    if action == 'terminate':
+        path = root / (request['label'] + '.job.status.json')
+        if not path.exists():
+            raise RuntimeError('Unknown process label: ' + request['label'])
+        state = json.loads(path.read_text())
+        if 'returncode' not in state:
+            terminate(state)
+        return True
+    if action == 'compress':
+        return compress(root, request)
+    if action == 'prune-run':
+        # The caller verified local copies (compressed bytes against the transfer
+        # manifest and decompressed bytes against the raw hashes). Remove exactly
+        # those files from this owned run, never anything else.
+        if any('returncode' not in json.loads(p.read_text())
+               for p in root.glob('*.job.status.json')):
+            raise RuntimeError('Refusing to prune a live run')
+        removed = []
+        for name, metadata in request['verified'].items():
+            path = (root / name).resolve()
+            if not path.is_relative_to(root) or path.is_symlink() or not path.is_file():
+                continue
+            if path.stat().st_size != metadata['size']:
+                raise RuntimeError('File changed after transfer: ' + name)
+            path.unlink()
+            removed.append(name)
+        return removed
     raise RuntimeError('Unknown action: ' + action)
+
+
+def run_json(argv, sudo, timeout=120):
+    """Run a tool that prints one JSON object; raise with its error otherwise."""
+    if sudo:
+        argv = ['sudo', '-n', '--'] + argv
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    lines = [line for line in proc.stdout.splitlines() if line.startswith('{')]
+    try:
+        result = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        result = None
+    if proc.returncode or not isinstance(result, dict) or result.get('ok') is False:
+        raise RuntimeError('%s failed (exit %d): %s %s' % (
+            ' '.join(argv), proc.returncode, (result or {}).get('error', proc.stdout[-2000:]),
+            proc.stderr[-2000:]))
+    return result
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for block in iter(lambda: source.read(1 << 22), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def compress(root, request):
+    """zstd every *.bin file in ROOT, verify, then delete the raw file.
+
+    For each file: hash the raw bytes, compress to FILE.zst, hash what
+    decompressing FILE.zst produces, and delete FILE only if the two hashes
+    match. compression-manifest.json maps each original name to its raw and
+    compressed sizes and hashes, so the receiver can verify end to end.
+    """
+    import shutil
+    if not shutil.which('zstd'):
+        raise RuntimeError('zstd is not installed on ' + os.uname().nodename)
+    if any('returncode' not in json.loads(p.read_text()) for p in root.glob('*.job.status.json')):
+        raise RuntimeError('Refusing to compress while run processes are alive')
+    manifest_path = root / 'compression-manifest.json'
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    level = int(request['level'])
+    threads = int(request.get('threads', 0))
+    for path in sorted(root.glob('*.bin')):
+        if path.is_symlink() or not path.is_file():
+            continue
+        name = path.name
+        target = path.with_name(name + '.zst')
+        raw_sha = sha256_file(path)
+        raw_size = path.stat().st_size
+        if target.exists():
+            target.unlink()  # a partial file from an interrupted attempt
+        argv = ['zstd', '-q', '-%d' % level, '-T%d' % threads, '--long=27', '-o', str(target), str(path)]
+        if level > 19:
+            argv.insert(1, '--ultra')
+        started = time.monotonic()
+        subprocess.run(argv, check=True, timeout=7200)
+        seconds = time.monotonic() - started
+        digest = hashlib.sha256()
+        with subprocess.Popen(['zstd', '-q', '-dc', '--long=27', str(target)], stdout=subprocess.PIPE) as check:
+            for block in iter(lambda: check.stdout.read(1 << 22), b''):
+                digest.update(block)
+        if check.returncode or digest.hexdigest() != raw_sha:
+            target.unlink(missing_ok=True)
+            raise RuntimeError('Compressed copy of %s does not decompress to the original' % name)
+        manifest[name] = dict(raw_size=raw_size, raw_sha256=raw_sha,
+                              zst_name=target.name, zst_size=target.stat().st_size,
+                              zst_sha256=sha256_file(target), seconds=round(seconds, 2), level=level)
+        save(manifest_path, manifest)
+        path.unlink()
+    return manifest
 
 
 if __name__ == '__main__':

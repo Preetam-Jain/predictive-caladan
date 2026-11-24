@@ -153,6 +153,32 @@ user_threads = 4
 swaptions = 5000000
 simulations = 400
 
+[pktlog]
+# Per-packet NIC timestamps from the server runtime plus per-request client
+# traces (docs/packet-logging.md). Used only on logging-on runs; requires
+# network.directpath. The segment lives in hugepages on pktlog.node, which
+# must be the socket NOT running Caladan (nodes.server.numa_node).
+enabled = false
+segment_path = "/dev/hugepages/caladan-pktlog"
+gib = 64
+node = 0
+join_after_collect = false # run scripts/join_requests.py on the desktop after each run
+python = "python3" # desktop interpreter with numpy, used for the join
+window_us = 100.0
+slo_us = 50.0
+
+[storage]
+compress = false # zstd every *.bin on the nodes after a run, verify, transfer only .zst
+zstd_level = 19
+zstd_threads = 0 # 0 = all cores (nothing is being measured while compressing)
+verify_raw = true # desktop decompresses each file and checks its raw sha256
+prune_remote = false # then delete the run's files from the nodes
+
+[schedule]
+load_steps = [] # e.g. [0.5, 1.0, 0.7]: rate multipliers, equal shares of measurement_seconds
+antagonist_start_seconds = -1.0 # seconds after load starts; -1 starts it before load
+antagonist_stop_seconds = -1.0 # seconds after load starts; -1 never stops it
+
 [batch_monitor]
 enabled = true
 binary = "apps/netbench/stress_shm_query"
