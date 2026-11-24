@@ -214,6 +214,27 @@ to use application ownership generations, so scheduling changes alone do not
 invalidate an application interval. The LLC ring now occupies 64 MiB.
 The decoder supports versions 4, 5, 6, and 7.
 
+## Versions 8 and 9
+
+Added the queue, task and delay streams (types 5-7) and the optional queue
+snapshot failure stream (type 8). See `iokernel/telemetry.c` for their layouts.
+
+## Version 10 — NIC clock calibration stream
+
+All version-9 streams are unchanged. Adds stream type 9, file suffix
+`.nicclock.bin`, written whenever the IOKernel has mapped the NIC clock
+(hardware timestamps enabled). The writer thread samples it every 1 ms:
+
+```
+u64 tsc_before, nic_clock, tsc_after;   /* 24 bytes */
+```
+
+`nic_clock` is the full 64-bit device clock read over MMIO (high word re-read to
+detect a carry). The header `selector` holds the NIC clock frequency in kHz.
+A linear fit of the bracket midpoints maps NIC completion timestamps (packet
+log, docs/packet-logging.md) to TSC. The ring holds 65,536 samples and is
+drained continuously. The decoder supports versions 4 through 10.
+
 ## Future changes
 
 Append a new version section with its exact layout and migration rationale when

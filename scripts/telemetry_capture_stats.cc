@@ -1,4 +1,4 @@
-// Bounded-memory analysis of version-8/9 telemetry; never prints raw records.
+// Bounded-memory analysis of version-8 through 10 telemetry; never prints raw records.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -41,7 +41,7 @@ struct Analyzer{
  bool in(uint64_t t)const{return t>=begin&&t<end;}int bin(uint64_t t)const{return std::clamp(int((t-begin)/hz),0,seconds-1);}
  template<class T,class F>void scan(const std::string&prefix,const std::string&suffix,F fn){
   std::ifstream f(prefix+'.'+suffix+".bin",std::ios::binary);if(!f)throw std::runtime_error("Missing stream "+suffix);Header h{};f.read((char*)&h,sizeof(h));
-  if(std::memcmp(h.magic,"CALATLM\0",8)||(h.version!=8&&h.version!=9)||h.record_bytes!=sizeof(T)||h.flags!=1||h.cpu!=cpu||h.dropped)throw std::runtime_error("Invalid/nonfinal/lossy stream "+suffix);
+  if(std::memcmp(h.magic,"CALATLM\0",8)||(h.version<8||h.version>10)||h.record_bytes!=sizeof(T)||h.flags!=1||h.cpu!=cpu||h.dropped)throw std::runtime_error("Invalid/nonfinal/lossy stream "+suffix);
   f.seekg(h.header_bytes);std::vector<T> block(65536);uint64_t remaining=h.produced,selected=0;uint64_t first=0,last=0;
   while(remaining){size_t n=std::min<uint64_t>(remaining,block.size());if(!f.read((char*)block.data(),n*sizeof(T)))throw std::runtime_error("Truncated "+suffix);for(size_t i=0;i<n;i++){const T&r=block[i];if(!first)first=r.tsc;last=r.tsc;selected+=in(r.tsc);fn(r);}remaining-=n;}
   char extra;if(f.read(&extra,1))throw std::runtime_error("Extra stream data "+suffix);counts[suffix]=selected;std::cerr<<suffix<<": "<<selected<<" records in window; scanned "<<h.produced<<'\n';

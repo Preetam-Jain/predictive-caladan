@@ -1,3 +1,4 @@
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -71,6 +72,14 @@ struct task_record {
     uint64_t tsc, task_elapsed_us, kthread_elapsed_us;
     uint32_t pid, tid, core, rcu_gen;
 };
+/*
+ * NIC clock calibration sample taken by the writer thread: the 64-bit device
+ * clock read over MMIO, bracketed by TSC reads. Used offline to convert NIC
+ * completion timestamps (packet log) to TSC.
+ */
+struct nic_clock_record {
+    uint64_t tsc_before, nic_clock, tsc_after;
+};
 struct delay_record {
     uint64_t tsc, rx_cycles;
     double max_us, min_us, avg_us;
@@ -87,6 +96,7 @@ enum stream_type {
     STREAM_TASK = 6,
     STREAM_DELAY = 7,
     STREAM_QUEUE_SNAPSHOT_FAILURE = 8,
+    STREAM_NIC_CLOCK = 9,
 };
 
 enum failure_reason {
@@ -124,6 +134,7 @@ _Static_assert(sizeof(struct sched_event_record) == 24, "scheduler event record 
 _Static_assert(sizeof(struct queue_record) == 64, "queue record size assert failed");
 _Static_assert(sizeof(struct task_record) == 40, "task record size assert failed");
 _Static_assert(sizeof(struct delay_record) == 56, "delay record size assert failed");
+_Static_assert(sizeof(struct nic_clock_record) == 24, "nic clock record size assert failed");
 _Static_assert(NCPU <= (uint32_t)UINT16_MAX + 1, "scheduler event CPU ID width assert failed");
 _Static_assert(sizeof(struct file_header) == 96, "file header size assert failed");
 _Static_assert(offsetof(struct file_header, cores) == sizeof(struct file_header),
@@ -134,9 +145,11 @@ _Static_assert(offsetof(struct file_header, cores) == sizeof(struct file_header)
 #define LLC_CAPACITY (1U << 20) // 1,048,576
 #define SCHED_EVENT_CAPACITY (1U << 18) // 262,144
 #define FAILURE_CAPACITY (1U << 12) // 4,096
+#define NIC_CLOCK_CAPACITY (1U << 16) // 65,536 samples, ~65 s at 1 ms
+#define NIC_CLOCK_INTERVAL_US 1000ULL
 
-/* Version 9 adds optional per-observation queue snapshot failure records. */
-#define FILE_FORMAT_VERSION 9U
+/* Version 10 adds the NIC clock calibration stream (type 9, selector = NIC kHz). */
+#define FILE_FORMAT_VERSION 10U
 #define MICROSECONDS_PER_SECOND 1000000ULL
 /* Bandwidth comes from the memory controller, not a selected core PMC event. */
 #define PMC_SELECTOR_NOT_APPLICABLE 0ULL
@@ -223,6 +236,23 @@ static struct stream *const streams[] = {
     &delay_stream,
     &queue_snapshot_failure_stream,
 };
+/*
+ * Produced and consumed by the writer thread itself, so it is not in streams[]
+ * (whose producer is the scheduler thread). Present whenever the IOKernel has
+ * mapped the NIC clock (hardware timestamps enabled).
+ */
+static struct stream nic_clock_stream = {
+    .suffix = ".nicclock.bin",
+    .type = STREAM_NIC_CLOCK,
+    .record_bytes = sizeof(struct nic_clock_record),
+    .capacity = NIC_CLOCK_CAPACITY,
+    .fd = -1,
+};
+/* Defined in hw_timestamp.c; NULL when hardware timestamps are disabled. */
+extern void *hca_core_clock;
+extern double device_us_per_cycle;
+static bool nic_clock_enabled;
+
 /* The optional stream is last; disabled logging allocates no ring or file. */
 static size_t nr_streams = ARRAY_SIZE(streams) - 1;
 
@@ -372,7 +402,10 @@ static int stream_open(struct stream *stream, int writer_node)
         .stream_type = stream->type,
         .cycles_per_us = cycles_per_us,
         .selector = (stream->type == STREAM_LLC || stream->type == STREAM_PMC_FAILURE)
-                    ? PMC_LLC_MISSES : PMC_SELECTOR_NOT_APPLICABLE,
+                    ? PMC_LLC_MISSES
+                    : stream->type == STREAM_NIC_CLOCK && device_us_per_cycle > 0
+                    ? (uint64_t)(1000.0 / device_us_per_cycle + 0.5)
+                    : PMC_SELECTOR_NOT_APPLICABLE,
         .writer_core = telemetry_core,
         .scheduler_core = sched_dp_core,
         .nr_cores = sched_cores_nr,
@@ -450,18 +483,65 @@ static int complete_stream(struct stream *stream)
     return error;
 }
 
+/* The device clock is big-endian; re-read if the high word changed mid-read. */
+static uint64_t read_nic_clock(void)
+{
+    const volatile uint32_t *clock = hca_core_clock;
+    uint32_t high, low, high_again;
+
+    do {
+        high = be32toh(clock[0]);
+        low = be32toh(clock[1]);
+        high_again = be32toh(clock[0]);
+    } while (high != high_again);
+    return ((uint64_t)high << 32) | low;
+}
+
+/* Writer-local producer: the writer is the only producer and consumer. */
+static void sample_nic_clock(void)
+{
+    struct stream *stream = &nic_clock_stream;
+    struct nic_clock_record record;
+    uint64_t next = atomic_load_explicit(&stream->head, memory_order_relaxed);
+
+    record.tsc_before = rdtscp(NULL);
+    record.nic_clock = read_nic_clock();
+    record.tsc_after = rdtscp(NULL);
+    if (next - atomic_load_explicit(&stream->tail, memory_order_relaxed) == stream->capacity) {
+        stream->dropped++;
+        return;
+    }
+    memcpy(stream->records + (next % stream->capacity) * stream->record_bytes,
+           &record, sizeof(record));
+    stream->produced++;
+    atomic_store_explicit(&stream->head, next + 1, memory_order_release);
+}
+
 static void *writer(void *initial_error)
 {
     int error = (int)(intptr_t)initial_error;
+    uint64_t next_clock_sample = 0;
+    const uint64_t clock_interval = NIC_CLOCK_INTERVAL_US * cycles_per_us;
     if (error)
         goto close_streams;
     for (;;) {
         bool done = atomic_load_explicit(&finished, memory_order_acquire);
         bool made_progress = false;
+        if (nic_clock_enabled && !done && rdtsc() >= next_clock_sample) {
+            sample_nic_clock();
+            next_clock_sample = rdtsc() + clock_interval;
+        }
         for (size_t i = 0; i < nr_streams; i++) {
             error = drain_batch(streams[i], done, &made_progress);
             if (error) {
                 log_err("telemetry%s: write failed: %s", streams[i]->suffix, strerror(error));
+                goto close_streams;
+            }
+        }
+        if (nic_clock_enabled) {
+            error = drain_batch(&nic_clock_stream, done, &made_progress);
+            if (error) {
+                log_err("telemetry%s: write failed: %s", nic_clock_stream.suffix, strerror(error));
                 goto close_streams;
             }
         }
@@ -474,6 +554,13 @@ static void *writer(void *initial_error)
         error = complete_stream(streams[i]);
         if (error) {
             log_err("telemetry%s: finalization failed: %s", streams[i]->suffix, strerror(error));
+            goto close_streams;
+        }
+    }
+    if (nic_clock_enabled) {
+        error = complete_stream(&nic_clock_stream);
+        if (error) {
+            log_err("telemetry%s: finalization failed: %s", nic_clock_stream.suffix, strerror(error));
             goto close_streams;
         }
     }
@@ -493,6 +580,18 @@ close_streams:
         free(streams[i]->header);
         streams[i]->header = NULL;
     }
+    if (nic_clock_enabled) {
+        if (close(nic_clock_stream.fd)) {
+            int close_error = errno;
+            log_err("telemetry%s: cannot close output file: %s",
+                    nic_clock_stream.suffix, strerror(close_error));
+            if (!error)
+                error = close_error;
+        }
+        nic_clock_stream.fd = -1;
+        free(nic_clock_stream.header);
+        nic_clock_stream.header = NULL;
+    }
     if (error) {
         atomic_store_explicit(&writer_error, error, memory_order_release);
         log_err("telemetry: capture failed: %s", strerror(error));
@@ -500,6 +599,9 @@ close_streams:
         for (size_t i = 0; i < nr_streams; i++)
             log_info("telemetry%s: records=%lu dropped=%lu", streams[i]->suffix,
                      streams[i]->produced, streams[i]->dropped);
+        if (nic_clock_enabled)
+            log_info("telemetry%s: records=%lu dropped=%lu", nic_clock_stream.suffix,
+                     nic_clock_stream.produced, nic_clock_stream.dropped);
         log_info("telemetry: all streams drained and closed");
     }
     return NULL;
@@ -546,6 +648,14 @@ int telemetry_init(void)
         if (error)
             goto fail;
     }
+    nic_clock_enabled = hca_core_clock != NULL;
+    if (nic_clock_enabled) {
+        error = stream_open(&nic_clock_stream, writer_node);
+        if (error)
+            goto fail;
+    } else {
+        log_warn("telemetry: NIC clock unavailable (no_hw_qdel?); no calibration stream");
+    }
     error = pthread_attr_init(&attributes);
     if (error) {
         log_err("telemetry: cannot initialize writer attributes: %s", strerror(error));
@@ -581,6 +691,16 @@ fail:
         free(streams[i]->header);
         streams[i]->header = NULL;
     }
+    if (nic_clock_stream.fd >= 0)
+        close(nic_clock_stream.fd);
+    nic_clock_stream.fd = -1;
+    if (nic_clock_stream.records)
+        munmap(nic_clock_stream.records,
+               nic_clock_stream.capacity * nic_clock_stream.record_bytes);
+    nic_clock_stream.records = NULL;
+    free(nic_clock_stream.header);
+    nic_clock_stream.header = NULL;
+    nic_clock_enabled = false;
     /* Partially created files remain incomplete, never overwriting prior runs. */
     return -error;
 }

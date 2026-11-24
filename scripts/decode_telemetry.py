@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream a version-4 through version-9 Caladan telemetry file to CSV."""
+"""Stream a version-4 through version-10 Caladan telemetry file to CSV."""
 from collections import namedtuple
 import argparse
 import csv
@@ -25,6 +25,8 @@ LAYOUTS = {
          'flags', 'reserved')),
     4: (struct.Struct('<QQIHH'), ('tsc', 'generation', 'pid', 'core', 'reason')),
     8: (struct.Struct('<Q4I'), ('tsc', 'pid', 'tid', 'core', 'reason')),
+    # Version 10: NIC clock calibration; header selector holds the NIC clock in kHz.
+    9: (struct.Struct('<3Q'), ('tsc_before', 'nic_clock', 'tsc_after')),
 }
 
 
@@ -60,12 +62,13 @@ def read_header(source):
     if len(raw) != HEADER.size:
         raise ValueError('truncated header')
     header = FileHeader._make(HEADER.unpack(raw))
-    if header.magic != b'CALATLM\0' or header.version not in (4, 5, 6, 7, 8, 9):
-        raise ValueError('unsupported capture format (requires version 4 through 9)')
+    if header.magic != b'CALATLM\0' or header.version not in (4, 5, 6, 7, 8, 9, 10):
+        raise ValueError('unsupported capture format (requires version 4 through 10)')
     if (header.stream_type not in LAYOUTS
             or (header.version < 8 and header.stream_type > 4)
             or (header.version == 4 and header.stream_type == 4)
-            or (header.version < 9 and header.stream_type == 8)):
+            or (header.version < 9 and header.stream_type == 8)
+            or (header.version < 10 and header.stream_type == 9)):
         raise ValueError(f'unknown stream type {header.stream_type}')
     layout, _ = record_layout(header)
     if (header.header_bytes != HEADER.size + header.nr_cores * 4
@@ -126,8 +129,11 @@ def capture_streams(prefix):
         header, _ = read_header(source)
     if header.version >= 8:
         optional = prefix + '.queue-snapshot-failure.bin'
-        return STREAM_FILES + ((('queue-snapshot-failure', 8),)
-                               if header.version >= 9 and os.path.exists(optional) else ())
+        streams = STREAM_FILES + ((('queue-snapshot-failure', 8),)
+                                  if header.version >= 9 and os.path.exists(optional) else ())
+        if header.version >= 10 and os.path.exists(prefix + '.nicclock.bin'):
+            streams += (('nicclock', 9),)
+        return streams
     return STREAM_FILES[:4] if header.version >= 5 else STREAM_FILES[:3]
 
 

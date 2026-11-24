@@ -11,6 +11,8 @@ unsigned int sched_dp_core;
 int sched_cores_nr;
 unsigned int sched_cores_tbl[NCPU];
 float ias_bw_estimate_multiplier;
+void *hca_core_clock;
+double device_us_per_cycle;
 struct iokernel_cfg cfg;
 void logk(int level, const char *fmt, ...) { (void)level; (void)fmt; }
 
@@ -60,6 +62,9 @@ static void emit_sample(struct stream *stream, uint64_t index)
         break;
     case STREAM_SCHED:
         telemetry_sched_event(7, 42, index, sched_reasons[index % ARRAY_SIZE(sched_reasons)]);
+        break;
+    case STREAM_NIC_CLOCK:
+        /* writer-produced; not in streams[] */
         break;
     }
 }
@@ -220,6 +225,11 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < ARRAY_SIZE(streams); i++)
         assert(munmap(streams[i]->records,
                       streams[i]->capacity * streams[i]->record_bytes) == 0);
-    puts("PASS: independent rings/drops, concurrent ordering/wraps, partial drain, disk failure");
+    /* The NIC clock page holds a big-endian 64-bit counter, high word first. */
+    uint32_t clock_page[2] = { htobe32(0x00000012U), htobe32(0x3456789aU) };
+    hca_core_clock = clock_page;
+    assert(read_nic_clock() == 0x000000123456789aULL);
+    hca_core_clock = NULL;
+    puts("PASS: independent rings/drops, concurrent ordering/wraps, partial drain, disk failure, NIC clock read");
     return 0;
 }
