@@ -40,14 +40,15 @@ struct mbuf {
 		uint8_t		txflags;  /* TX offload flags */
 	};
 	uint8_t		flags;	    /* TCP: which flags were set? */
-	uint16_t	pad;
+	uint16_t	pktlog_tx;  /* directpath TX: 1 = log TCP payload at completion */
 	atomic_t	ref;	    /* a reference count for the mbuf */
 	unsigned long	release_data;	/* data for the release method */
 	void		(*release)(struct mbuf *m); /* frees the mbuf */
 
 	/* TCP fields */
 	struct list_node link;	    /* list node for RX and TX queues */
-	uint64_t	timestamp;  /* the time the packet was last sent */
+	uint64_t	timestamp;  /* TX: the time the packet was last sent;
+				       directpath RX: NIC completion timestamp */
 	uint32_t	seg_seq;    /* the first seg number */
 	uint32_t	seg_end;    /* the last seg number (noninclusive) */
 };

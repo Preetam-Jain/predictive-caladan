@@ -14,6 +14,7 @@
 #include <runtime/timer.h>
 
 #include "tcp.h"
+#include "../pktlog.h"
 
 /* protects @tcp_conns */
 static DEFINE_SPINLOCK(tcp_lock);
@@ -255,6 +256,11 @@ void tcp_conn_set_state(tcpconn_t *c, int new_state)
 	    new_state >= TCP_STATE_ESTABLISHED) {
 		waitq_release(&c->tx_wq, &c->lock);
 		poll_set(&c->poll_src, POLLOUT);
+		/* irs/iss let offline tools turn sequence numbers into byte offsets */
+		if (unlikely(pktlog_enabled))
+			pktlog_append(PKTLOG_CONN, rdtsc(), c->pcb.irs, c->pcb.iss,
+				      c->e.raddr.ip, c->e.raddr.port,
+				      c->e.laddr.port);
 	}
 
 	tcp_debug_state_change(c, c->pcb.state, new_state);

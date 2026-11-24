@@ -15,6 +15,7 @@
 #include <net/tcp.h>
 
 #include "tcp.h"
+#include "../pktlog.h"
 #include "defs.h"
 
 #define TCP_SLOWPATH_FLAGS (TCP_FIN|TCP_RST|TCP_URG)
@@ -212,6 +213,11 @@ void tcp_rx_conn(struct trans_entry *e, struct mbuf *m)
 	m->seg_seq = seq;
 	m->seg_end = seq + len;
 	m->flags = tcphdr->flags;
+
+	/* directpath set m->timestamp to the NIC receive completion time */
+	if (unlikely(pktlog_enabled) && len)
+		pktlog_append(PKTLOG_RX, m->timestamp, seq, seq + len,
+			      c->e.raddr.ip, c->e.raddr.port, c->e.laddr.port);
 
 	/* pull off options */
 	optlen = hdr_len - sizeof(struct tcp_hdr);

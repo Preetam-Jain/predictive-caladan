@@ -42,6 +42,7 @@ static const struct init_entry global_init_handlers[] = {
 	GLOBAL_INITIALIZER(net),
 	GLOBAL_INITIALIZER(udp),
 	GLOBAL_INITIALIZER(directpath),
+	GLOBAL_INITIALIZER(pktlog),
 	GLOBAL_INITIALIZER(arp),
 	GLOBAL_INITIALIZER(trans),
 

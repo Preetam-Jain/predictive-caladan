@@ -721,6 +721,7 @@ extern int trans_init(void);
 extern int smalloc_init(void);
 extern int storage_init(void);
 extern int directpath_init(void);
+extern int pktlog_init(void);
 
 /* late initialization */
 extern int ioqueues_register_iokernel(void);

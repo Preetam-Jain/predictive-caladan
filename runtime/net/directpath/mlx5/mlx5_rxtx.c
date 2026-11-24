@@ -10,7 +10,12 @@
 #include <util/mmio.h>
 #include <util/udma_barrier.h>
 
+#include <net/ethernet.h>
+#include <net/ip.h>
+#include <net/tcp.h>
+
 #include "mlx5.h"
+#include "../../../pktlog.h"
 
 off_t rx_mr_offset;
 off_t tx_mr_offset;
@@ -215,11 +220,64 @@ static int mlx5_gather_completions(struct mbuf **mbufs, struct mlx5_txq *v,
 
 		wqe_idx = be16toh(cqe->wqe_counter) & (v->wq.cnt - 1);
 		mbufs[compl_cnt] = load_acquire(&v->wq.buffers[wqe_idx]);
+		if (unlikely(pktlog_enabled) && mbufs[compl_cnt]->pktlog_tx == 1) {
+			struct mbuf *m = mbufs[compl_cnt];
+
+			/* the NIC wrote this timestamp when it completed the send */
+			pktlog_append(PKTLOG_TX, be64toh(ACCESS_ONCE(cqe->timestamp)),
+				      m->seg_seq, m->seg_end, m->tx_dst_ip,
+				      m->tx_l4_dport, m->tx_l4_sport);
+		}
 	}
 
 	v->cq.dbr[0] = htobe32(v->cq.head & 0xffffff);
 
 	return compl_cnt;
+}
+
+/*
+ * pktlog_mark_tx - record whether a TCP payload segment should be logged when
+ * its send completes. The headers were just written by this core, so parsing
+ * them here touches cached lines; the completion path then reads only mbuf
+ * fields. Ports and the remote address are kept in the loopback-hint fields,
+ * which the directpath TX path does not use after this point.
+ */
+static inline void pktlog_mark_tx(struct mbuf *m)
+{
+	const struct eth_hdr *eh;
+	const struct ip_hdr *iph;
+	const struct tcp_hdr *th;
+	unsigned int len, ihl, doff, ip_len;
+
+	if (likely(!pktlog_enabled))
+		return;
+
+	m->pktlog_tx = 0;
+	len = mbuf_length(m);
+	if (len < sizeof(*eh) + sizeof(*iph) + sizeof(*th))
+		return;
+	eh = (const struct eth_hdr *)mbuf_data(m);
+	if (eh->type != hton16(ETHTYPE_IP))
+		return;
+	iph = (const struct ip_hdr *)(eh + 1);
+	if (iph->proto != IPPROTO_TCP)
+		return;
+	ihl = iph->header_len * 4;
+	if (ihl < sizeof(*iph) || sizeof(*eh) + ihl + sizeof(*th) > len)
+		return;
+	th = (const struct tcp_hdr *)((const unsigned char *)iph + ihl);
+	doff = th->off * 4;
+	ip_len = ntoh16(iph->len);
+	if (ip_len <= ihl + doff)
+		return;		/* no payload: pure ACK, SYN, FIN or RST */
+	if (ntoh32(th->seq) != m->seg_seq ||
+	    m->seg_end - m->seg_seq != ip_len - ihl - doff)
+		return;		/* not a TCP stack data mbuf */
+
+	m->tx_dst_ip = ntoh32(iph->daddr);
+	m->tx_l4_sport = ntoh16(th->sport);
+	m->tx_l4_dport = ntoh16(th->dport);
+	m->pktlog_tx = 1;
 }
 
 /*
@@ -266,6 +324,7 @@ int mlx5_transmit_one(struct mbuf *m)
 
 	assert(mbuf_length(m) >= MLX5_ETH_L2_INLINE_HEADER_SIZE);
 	memcpy(eseg->inline_hdr_start, mbuf_data(m), MLX5_ETH_L2_INLINE_HEADER_SIZE);
+	pktlog_mark_tx(m);
 
 	dpseg->byte_count = htobe32(mbuf_length(m) - MLX5_ETH_L2_INLINE_HEADER_SIZE);
 	dpseg->addr = htobe64((uint64_t)mbuf_data(m) + MLX5_ETH_L2_INLINE_HEADER_SIZE + tx_mr_offset);
@@ -329,6 +388,7 @@ static struct mbuf *mbuf_fill_cqe(struct mbuf *m, struct mlx5_cqe64 *cqe)
 	mbuf_init(m, dbuf, len, 0);
 	m->len = len;
 	m->csum_type = mlx5_csum_ok(cqe);
+	m->timestamp = be64toh(ACCESS_ONCE(cqe->timestamp));
 	return m;
 }
 
