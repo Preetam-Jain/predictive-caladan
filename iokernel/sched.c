@@ -469,7 +469,8 @@ static uint64_t calc_delay_tsc(uint64_t tsc)
 static void
 sched_update_kthread_metrics(struct thread *th, bool work_pending)
 {
-	uint32_t rcu_gen, uthread_elapsed_tsc;
+	uint32_t rcu_gen;
+	uint64_t uthread_elapsed_tsc;
 
 	rcu_gen = ACCESS_ONCE(th->q_ptrs->rcu_gen);
 	if ((rcu_gen & 0x1) == 0) {
