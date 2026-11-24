@@ -16,3 +16,4 @@ scripts/experiments/__pycache__/
 tests/experiments/__pycache__/
 !scripts/experiments/
 !tests/experiments/
+scripts/pktlog/pktlogctl

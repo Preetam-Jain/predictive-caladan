@@ -44,7 +44,7 @@ DPDK_LIBS=$(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs --static 
 
 
 # must be first
-all: libbase.a libnet.a libruntime.a iokerneld $(test_targets) shim
+all: libbase.a libnet.a libruntime.a iokerneld $(test_targets) shim scripts/pktlog/pktlogctl
 
 $(iokernel_obj): INC += -I$(DPDK_PATH)/build/include
 
@@ -63,6 +63,10 @@ libruntime.a: $(runtime_obj)
 iokerneld: $(iokernel_obj) libbase.a libnet.a base/base.ld $(PCM_DEPS)
 	$(LD) $(LDFLAGS) -o $@ $(iokernel_obj) libbase.a libnet.a $(DPDK_LIBS) \
 	$(PCM_DEPS) $(PCM_LIBS) -lpthread -lnuma -ldl
+
+# packet log segment tool (standalone; no Caladan libraries)
+scripts/pktlog/pktlogctl: scripts/pktlog/pktlogctl.c inc/pktlog.h
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Iinc -pthread -o $@ $<
 
 $(test_targets): $(test_obj) libbase.a libruntime.a libnet.a base/base.ld
 	$(LD) $(FLAGS) $(LDFLAGS) -o $@ $@.o $(RUNTIME_LIBS)
@@ -104,5 +108,5 @@ submodules-clean:
 .PHONY: clean
 clean:
 	rm -f $(obj) $(dep) libbase.a libnet.a libruntime.a \
-	iokerneld $(test_targets)
+	iokerneld $(test_targets) scripts/pktlog/pktlogctl
 	$(MAKE) -C shim/ clean
