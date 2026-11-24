@@ -80,6 +80,86 @@ pub struct Packet {
     completion_time_ns: Arc<AtomicU64>,
     completion_server_tsc: Option<u64>,
     completion_time: Option<Duration>,
+    /// Bytes written on this connection through the end of this request (0: not written).
+    req_end: u64,
+    /// Request size in bytes.
+    req_bytes: u32,
+    /// Bytes read on this connection through the end of this request's response (0: none).
+    resp_end: u64,
+}
+
+/// Output prefix for per-connection binary request traces (--trace-prefix).
+static TRACE_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Distinguishes repeated worker invocations within one process.
+static TRACE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+const TRACE_MAGIC: &[u8; 8] = b"CALCTRC\0";
+const TRACE_VERSION: u32 = 1;
+const TRACE_HEADER_BYTES: u32 = 64;
+const TRACE_RECORD_BYTES: u32 = 48;
+const TRACE_STATUS_COMPLETED: u8 = 0;
+const TRACE_STATUS_NO_RESPONSE: u8 = 1;
+const TRACE_STATUS_NOT_SENT: u8 = 2;
+const TRACE_STATUS_NOT_ENQUEUED: u8 = 3;
+
+/// Writes one connection's requests, including warmup and discarded ones, as
+/// fixed 48-byte little-endian records (see docs/packet-logging.md).
+fn write_request_trace(
+    prefix: &str,
+    index: usize,
+    local_port: u16,
+    protocol_id: u16,
+    start_unix_ns: u64,
+    packets: &[Packet],
+) -> io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::BufWriter;
+
+    let sequence = TRACE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let path = format!("{}.c{:03}.s{:03}.bin", prefix, index, sequence);
+    let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+    let mut out = BufWriter::with_capacity(1 << 20, file);
+
+    let mut header = Vec::with_capacity(TRACE_HEADER_BYTES as usize);
+    header.extend_from_slice(TRACE_MAGIC);
+    header.extend_from_slice(&TRACE_VERSION.to_le_bytes());
+    header.extend_from_slice(&TRACE_HEADER_BYTES.to_le_bytes());
+    header.extend_from_slice(&TRACE_RECORD_BYTES.to_le_bytes());
+    header.extend_from_slice(&(index as u32).to_le_bytes());
+    header.extend_from_slice(&local_port.to_le_bytes());
+    header.extend_from_slice(&protocol_id.to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
+    header.extend_from_slice(&start_unix_ns.to_le_bytes());
+    header.extend_from_slice(&(packets.len() as u64).to_le_bytes());
+    header.extend_from_slice(&1u32.to_le_bytes()); // flags: complete
+    header.extend_from_slice(&0u32.to_le_bytes());
+    header.extend_from_slice(&0u64.to_le_bytes());
+    assert_eq!(header.len(), TRACE_HEADER_BYTES as usize);
+    out.write_all(&header)?;
+
+    let mut record = [0u8; TRACE_RECORD_BYTES as usize];
+    for p in packets {
+        let actual = p.actual_start.map_or(-1i64, |d| duration_to_ns(d) as i64);
+        let (status, latency) = match (p.actual_start, p.completion_time) {
+            (None, _) => (TRACE_STATUS_NOT_SENT, -1i64),
+            (Some(_), None) => (TRACE_STATUS_NO_RESPONSE, -1i64),
+            (Some(start), Some(end)) if start == end => (TRACE_STATUS_NOT_ENQUEUED, -1i64),
+            (Some(start), Some(end)) => (TRACE_STATUS_COMPLETED, duration_to_ns(end - start) as i64),
+        };
+        record[0..8].copy_from_slice(&duration_to_ns(p.target_start).to_le_bytes());
+        record[8..16].copy_from_slice(&actual.to_le_bytes());
+        record[16..24].copy_from_slice(&latency.to_le_bytes());
+        record[24..32].copy_from_slice(&p.req_end.to_le_bytes());
+        record[32..40].copy_from_slice(&p.resp_end.to_le_bytes());
+        record[40..44].copy_from_slice(&p.req_bytes.to_le_bytes());
+        record[44] = status;
+        record[45] = 0;
+        record[46..48].copy_from_slice(&0u16.to_le_bytes());
+        out.write_all(&record)?;
+    }
+    let file = out.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 mod fakework;
@@ -208,6 +288,16 @@ trait LoadgenProtocol: Send + Sync {
     fn gen_req(&self, i: usize, p: &Packet, buf: &mut Vec<u8>);
     fn uses_ordered_requests(&self) -> bool;
     fn read_response(&self, sock: &Connection, scratch: &mut Buffer) -> io::Result<(usize, u64)>;
+    /// Like read_response, plus the response's size in bytes on a TCP stream;
+    /// 0 when the protocol cannot tell (byte-offset tracing unsupported).
+    fn read_response_sized(
+        &self,
+        sock: &Connection,
+        scratch: &mut Buffer,
+    ) -> io::Result<(usize, u64, u64)> {
+        let (idx, tsc) = self.read_response(sock, scratch)?;
+        Ok((idx, tsc, 0))
+    }
 }
 
 impl LoadgenProtocol for Protocol {
@@ -238,6 +328,20 @@ impl LoadgenProtocol for Protocol {
             Protocol::Dns(proto) => proto.read_response(sock, scratch),
             Protocol::Reflex(proto) => proto.read_response(sock, scratch),
             Protocol::Http(proto) => proto.read_response(sock, scratch),
+        }
+    }
+
+    fn read_response_sized(
+        &self,
+        sock: &Connection,
+        scratch: &mut Buffer,
+    ) -> io::Result<(usize, u64, u64)> {
+        match self {
+            Protocol::Synthetic(proto) => proto.read_response_sized(sock, scratch),
+            Protocol::Memcached(proto) => proto.read_response_sized(sock, scratch),
+            Protocol::Dns(proto) => proto.read_response_sized(sock, scratch),
+            Protocol::Reflex(proto) => proto.read_response_sized(sock, scratch),
+            Protocol::Http(proto) => proto.read_response_sized(sock, scratch),
         }
     }
 }
@@ -932,14 +1036,18 @@ fn run_client_worker(
         let mut receive_times = vec![None; packets_per_thread];
         let mut buf = Buffer::new(&mut recv_buf);
         let use_ordering = rproto.uses_ordered_requests();
+        // Bytes read on this connection through the end of each response.
+        let mut received_bytes: u64 = 0;
         wg2.follower_notify();
         for i in 0..receive_times.len() {
-            match rproto.read_response(&socket2, &mut buf) {
-                Ok((mut idx, tsc)) => {
+            match rproto.read_response_sized(&socket2, &mut buf) {
+                Ok((mut idx, tsc, bytes)) => {
                     if use_ordering {
                         idx = i;
                     }
-                    receive_times[idx] = Some((Instant::now(), tsc));
+                    received_bytes += bytes;
+                    let resp_end = if bytes > 0 { received_bytes } else { 0 };
+                    receive_times[idx] = Some((Instant::now(), tsc, resp_end));
                 }
                 Err(e) => {
                     match e.raw_os_error() {
@@ -975,8 +1083,13 @@ fn run_client_worker(
 
     wg.follower_notify().follower_wait();
     let start = Instant::now();
+    let start_unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
     let mut sched_idx = 0;
     let mut no_tx_buffers = 0usize;
+    // Bytes written on this connection; requests are written whole or not at all.
+    let mut sent_bytes: u64 = 0;
 
     stat_conn.trigger_stat()?;
 
@@ -1020,6 +1133,9 @@ fn run_client_worker(
                 }
             }
         }
+        sent_bytes += payload.len() as u64;
+        packet.req_end = sent_bytes;
+        packet.req_bytes = payload.len() as u32;
     }
 
     if no_tx_buffers > 0 {
@@ -1048,11 +1164,32 @@ fn run_client_worker(
                 }),
         )
         .for_each(|(c, p)| {
-            if let Some((inst, tsc)) = c {
+            if let Some((inst, tsc, resp_end)) = c {
                 (*p).completion_time = Some(inst - start);
                 (*p).completion_server_tsc = Some(tsc);
+                (*p).resp_end = resp_end;
             }
         });
+
+    if let Some(prefix) = TRACE_PREFIX.get() {
+        let protocol_id = match proto {
+            Protocol::Memcached(_) => 1u16,
+            Protocol::Synthetic(_) => 2u16,
+            _ => 0u16,
+        };
+        if let Err(e) = write_request_trace(
+            prefix,
+            index,
+            src_addr.port(),
+            protocol_id,
+            start_unix_ns,
+            &packets,
+        ) {
+            // A run without its trace is unusable; fail loudly.
+            eprintln!("Request trace write failed (connection {}): {}", index, e);
+            return Err(e);
+        }
+    }
 
     let mut start_index = 0;
     Ok(schedules
@@ -1381,6 +1518,11 @@ fn run_sample(
     wg.leader_catch_all().leader_rearm(nthreads);
     barrier_group.barrier()?;
     let start_unix = SystemTime::now();
+    // Marker for experiment runners: workers start their schedules now.
+    println!(
+        "LOADGEN_LOAD_START unix_ns={}",
+        start_unix.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+    );
     wg.leader_release_all();
 
     // In-thread post-communication processing only happens after all comms are done.
@@ -1956,6 +2098,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("us to calibrate fake work for"),
         )
         .arg(
+            Arg::new("trace-prefix")
+                .long("trace-prefix")
+                .value_name("PATH_PREFIX")
+                .help("Write per-connection binary request traces to PREFIX.cNNN.sNNN.bin"),
+        )
+        .arg(
             Arg::new("output")
                 .short('o')
                 .long("output")
@@ -2084,6 +2232,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg_file = matches.get_one::<String>("config").map(|s| s.to_string());
     let leader_ip: Option<Ipv4Addr> = matches.get_one::<Ipv4Addr>("leader-ip").copied();
+    if let Some(prefix) = matches.get_one::<String>("trace-prefix") {
+        TRACE_PREFIX.set(prefix.clone()).expect("trace prefix set twice");
+    }
 
     if let Some(leader_ip) = leader_ip {
         Backend::Runtime.init_and_run(cfg_file.as_deref(), move || loop {
@@ -2189,7 +2340,45 @@ mod overload_tests {
             actual_start: start.map(Duration::from_micros),
             completion_time: end.map(Duration::from_micros),
             completion_time_ns: Arc::new(AtomicU64::new(0)),
-            completion_server_tsc: if end.is_some() && start != end { Some(123) } else { None } }
+            completion_server_tsc: if end.is_some() && start != end { Some(123) } else { None },
+            ..Default::default() }
+    }
+
+    #[test]
+    fn request_trace_layout_matches_join_script() {
+        let mut sent = packet(Some(10), Some(25));
+        sent.req_end = 44;
+        sent.req_bytes = 44;
+        sent.resp_end = 30;
+        let mut lost = packet(Some(30), None);
+        lost.req_end = 88;
+        lost.req_bytes = 44;
+        let packets = vec![sent, lost, packet(None, None), packet(Some(40), Some(40))];
+        let prefix = std::env::temp_dir().join(format!("ctrace-test-{}", std::process::id()));
+        let prefix = prefix.to_str().unwrap().to_string();
+        write_request_trace(&prefix, 7, 107, 1, 123, &packets).unwrap();
+        let path = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_str().unwrap().starts_with(&prefix))
+            .unwrap();
+        let data = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(data.len(), 64 + 48 * 4);
+        assert_eq!(&data[0..8], b"CALCTRC\0");
+        assert_eq!(u32::from_le_bytes(data[20..24].try_into().unwrap()), 7);
+        assert_eq!(u16::from_le_bytes(data[24..26].try_into().unwrap()), 107);
+        assert_eq!(u64::from_le_bytes(data[40..48].try_into().unwrap()), 4);
+        let rec = |i: usize| &data[64 + 48 * i..64 + 48 * (i + 1)];
+        let i64_at = |r: &[u8], o: usize| i64::from_le_bytes(r[o..o + 8].try_into().unwrap());
+        let u64_at = |r: &[u8], o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
+        assert_eq!(i64_at(rec(0), 8), 10_000);
+        assert_eq!(i64_at(rec(0), 16), 15_000);
+        assert_eq!((u64_at(rec(0), 24), u64_at(rec(0), 32)), (44, 30));
+        assert_eq!(rec(0)[44], TRACE_STATUS_COMPLETED);
+        assert_eq!((rec(1)[44], i64_at(rec(1), 16), u64_at(rec(1), 24)), (TRACE_STATUS_NO_RESPONSE, -1, 88));
+        assert_eq!((rec(2)[44], i64_at(rec(2), 8)), (TRACE_STATUS_NOT_SENT, -1));
+        assert_eq!(rec(3)[44], TRACE_STATUS_NOT_ENQUEUED);
     }
 
     #[test]

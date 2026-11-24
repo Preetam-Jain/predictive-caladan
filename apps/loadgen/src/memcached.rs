@@ -235,7 +235,17 @@ impl LoadgenProtocol for MemcachedProtocol {
         write_key(buf, key, self.key_size);
     }
 
-    fn read_response(&self, mut sock: &Connection, buf: &mut Buffer) -> io::Result<(usize, u64)> {
+    fn read_response(&self, sock: &Connection, buf: &mut Buffer) -> io::Result<(usize, u64)> {
+        let (idx, cas, _) = self.read_response_sized(sock, buf)?;
+        Ok((idx, cas))
+    }
+
+    /// Also returns the response's size in bytes on a TCP stream (0 for UDP).
+    fn read_response_sized(
+        &self,
+        mut sock: &Connection,
+        buf: &mut Buffer,
+    ) -> io::Result<(usize, u64, u64)> {
         let scratch = buf.get_empty_buf();
         let hdr = match self.tport {
             Transport::Udp => {
@@ -265,6 +275,10 @@ impl LoadgenProtocol for MemcachedProtocol {
                 format!("Not NoError {}", hdr.vbucket_id_or_status),
             ));
         }
-        Ok((0, hdr.cas))
+        let bytes = match self.tport {
+            Transport::Udp => 0,
+            Transport::Tcp => 24 + hdr.total_body_length as u64,
+        };
+        Ok((0, hdr.cas, bytes))
     }
 }

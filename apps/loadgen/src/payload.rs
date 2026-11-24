@@ -41,6 +41,15 @@ impl LoadgenProtocol for SyntheticProtocol {
         let payload = Payload::deserialize(&mut &scratch[..])?;
         Ok((payload.index as usize, payload.randomness))
     }
+
+    fn read_response_sized(
+        &self,
+        sock: &Connection,
+        buf: &mut Buffer,
+    ) -> io::Result<(usize, u64, u64)> {
+        let (idx, tsc) = self.read_response(sock, buf)?;
+        Ok((idx, tsc, PAYLOAD_SIZE as u64))
+    }
 }
 
 impl SyntheticProtocol {
