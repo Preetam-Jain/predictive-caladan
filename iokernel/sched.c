@@ -506,27 +506,29 @@ sched_measure_kthread_delay(struct proc *p, struct thread *th, uint64_t *thread_
 	enum rq_snapshot_result result = rq_read_snapshot(th->q_ptrs, &snapshot);
 	bool snapshot_valid = result == RQ_SNAPSHOT_VALID;
 
-	if (!snapshot_valid)
+	if (!snapshot_valid) {
 		telemetry_queue_snapshot_failure(cur_tsc, p->pid, th->tid, th->core, result);
+		snapshot.tail = load_acquire(&th->q_ptrs->rq_tail);
+		snapshot.head = ACCESS_ONCE(th->q_ptrs->rq_head);
+		snapshot.oldest_tsc = ACCESS_ONCE(th->q_ptrs->oldest_tsc);
+	}
 
 	/* UTHREAD: measure delay */
-	if (snapshot_valid) {
-		last_tail = th->last_rq_tail;
-		cur_tail = snapshot.tail;
-		last_head = th->last_rq_head;
-		cur_head = snapshot.head;
-		th->last_rq_head = cur_head;
-		th->last_rq_tail = cur_tail;
+	last_tail = th->last_rq_tail;
+	cur_tail = snapshot.tail;
+	last_head = th->last_rq_head;
+	cur_head = snapshot.head;
+	th->last_rq_head = cur_head;
+	th->last_rq_tail = cur_tail;
 
-		/* UTHREAD: update old standing queue signal */
-		*has_work |= cur_head != cur_tail;
-		*standing_queue |= wraps_lt(cur_tail, last_head);
+	/* UTHREAD: update old standing queue signal */
+	*has_work |= cur_head != cur_tail;
+	*standing_queue |= wraps_lt(cur_tail, last_head);
 
-		/* UTHREAD: update new queueing delay signal */
-		if (cur_head != cur_tail) {
-			tmp = snapshot.oldest_tsc;
-			*thread_delay += calc_delay_tsc(tmp);
-		}
+	/* UTHREAD: update new queueing delay signal */
+	if (cur_head != cur_tail) {
+		tmp = snapshot.oldest_tsc;
+		*thread_delay += calc_delay_tsc(tmp);
 	}
 
 	runnable_delay_cycles = *thread_delay - prev_delay;
@@ -746,9 +748,10 @@ static void sched_measure_delay(struct proc *p)
 	                p->pid, sched_threads_active(p),
 	                (dl.has_work ? 1U : 0U) | (dl.parked_thread_busy ? 2U : 0U) |
 	                (dl.standing_queue ? 4U : 0U) | (snapshot_valid ? 0U : 8U));
-	/* Do not feed a partial runnable-delay observation into the policy. */
-	if (!snapshot_valid)
-		return;
+	/*
+	 * The policy always runs, using the fallback reads when a snapshot failed,
+	 * so telemetry validation does not change scheduling behavior.
+	 */
 	/* report delay back to runtime */
 	sched_report_metrics(p, dl.max_delay_us);
 
