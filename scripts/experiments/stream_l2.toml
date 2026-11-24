@@ -1,0 +1,32 @@
+# Uses the same copy worker that setup builds for STREAM-DRAM.
+# Fill in the server and client hosts before running on a fresh deployment.
+[conditions]
+memcached_alone = false
+memcached_stream_dram = true
+memcached_swaptions_gc = false
+
+[allocation]
+use_smt = false
+memcached_cores = 25
+memcached_guaranteed = 25
+antagonist_cores = 9
+antagonist_guaranteed = 9
+
+[stream_dram]
+# Caladan's STREAM-L2 recipe uses L2 size / 3.5, rounded down to 64 bytes.
+# The CloudLab r650 L2 is 1,310,720 bytes per core.
+region_bytes_per_worker = 374464
+iterations_per_operation = 100
+use_barrier = false
+
+[logging]
+run_without_logging = false
+run_with_logging = true
+
+[suite]
+repetitions = 1
+load_fractions = [1.0]
+
+[calibration]
+enabled = false
+capacity_rps = 1000000
